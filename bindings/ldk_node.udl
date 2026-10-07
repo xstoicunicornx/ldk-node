@@ -69,7 +69,6 @@ interface Node {
 	Bolt12Payment bolt12_payment();
 	SpontaneousPayment spontaneous_payment();
 	OnchainPayment onchain_payment();
-	[Throws=NodeError]
 	PayjoinPayment payjoin_payment();
 	Liquidity liquidity();
 	ForwardingAnalytics forwarding_analytics();

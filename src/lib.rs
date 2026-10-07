@@ -1240,18 +1240,16 @@ impl Node {
 	///
 	/// [Payjoin]: https://payjoin.org
 	#[cfg(not(feature = "uniffi"))]
-	pub fn payjoin_payment(&self) -> Result<PayjoinPayment, Error> {
-		let manager = self.payjoin_manager.as_ref().ok_or(Error::PayjoinNotConfigured)?;
-		Ok(PayjoinPayment::new(Arc::clone(manager), Arc::clone(&self.is_running)))
+	pub fn payjoin_payment(&self) -> PayjoinPayment {
+		PayjoinPayment::new(self.payjoin_manager.clone(), Arc::clone(&self.is_running))
 	}
 
 	/// Returns a payment handler allowing to receive [Payjoin] payments.
 	///
 	/// [Payjoin]: https://payjoin.org
 	#[cfg(feature = "uniffi")]
-	pub fn payjoin_payment(&self) -> Result<Arc<PayjoinPayment>, Error> {
-		let manager = self.payjoin_manager.as_ref().ok_or(Error::PayjoinNotConfigured)?;
-		Ok(Arc::new(PayjoinPayment::new(Arc::clone(manager), Arc::clone(&self.is_running))))
+	pub fn payjoin_payment(&self) -> Arc<PayjoinPayment> {
+		Arc::new(PayjoinPayment::new(self.payjoin_manager.clone(), Arc::clone(&self.is_running)))
 	}
 }
 

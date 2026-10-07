@@ -5,7 +5,7 @@
 // http://opensource.org/licenses/MIT>, at your option. You may not use this file except in
 // accordance with one or both of these licenses.
 
-//! Holds a payment handler for sending and receiving Payjoin payments.
+//! Holds a payment handler for receiving Payjoin payments.
 
 pub(crate) mod manager;
 pub(crate) mod payjoin_session;
@@ -46,13 +46,27 @@ macro_rules! maybe_map_fee_rate_opt {
 /// [`Node::payjoin_payment`]: crate::Node::payjoin_payment
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct PayjoinPayment {
-	manager: Arc<PayjoinManager>,
+	manager: Option<Arc<PayjoinManager>>,
 	is_running: Arc<RwLock<bool>>,
 }
 
 impl PayjoinPayment {
-	pub(crate) fn new(manager: Arc<PayjoinManager>, is_running: Arc<RwLock<bool>>) -> Self {
+	pub(crate) fn new(manager: Option<Arc<PayjoinManager>>, is_running: Arc<RwLock<bool>>) -> Self {
 		Self { manager, is_running }
+	}
+
+	/// Returns the manager, or the reason it is unavailable.
+	///
+	/// Payjoin is optional, so the handler is always obtainable and reports an unconfigured node
+	/// here rather than at [`Node::payjoin_payment`].
+	///
+	/// [`Node::payjoin_payment`]: crate::Node::payjoin_payment
+	fn manager(&self) -> Result<&Arc<PayjoinManager>, Error> {
+		if !*self.is_running.read().expect("lock") {
+			return Err(Error::NotRunning);
+		}
+
+		self.manager.as_ref().ok_or(Error::PayjoinNotConfigured)
 	}
 }
 
@@ -68,12 +82,8 @@ impl PayjoinPayment {
 	pub async fn receive(
 		&self, amount_sats: u64, fee_rate: Option<FeeRate>,
 	) -> Result<PayjoinReceiveSession, Error> {
-		if !*self.is_running.read().expect("lock") {
-			return Err(Error::NotRunning);
-		}
-
 		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
-		self.manager.receive_payjoin(amount_sats, fee_rate_opt).await
+		self.manager()?.receive_payjoin(amount_sats, fee_rate_opt).await
 	}
 
 	/// Cancels an active Payjoin session.
@@ -81,10 +91,6 @@ impl PayjoinPayment {
 	/// If the sender already supplied their original transaction it is broadcast, so the payment
 	/// still settles as an ordinary on-chain send.
 	pub async fn cancel(&self, session_id: PaymentId) -> Result<(), Error> {
-		if !*self.is_running.read().expect("lock") {
-			return Err(Error::NotRunning);
-		}
-
-		self.manager.cancel_receiver_session(session_id).await
+		self.manager()?.cancel_receiver_session(session_id).await
 	}
 }
