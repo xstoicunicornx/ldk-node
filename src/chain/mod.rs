@@ -707,15 +707,28 @@ impl ChainSource {
 		}
 	}
 
+	/// Whether this chain source provides everything the payjoin receiver needs: a
+	/// `testmempoolaccept`-style broadcast check.
+	pub(crate) fn supports_payjoin(&self) -> bool {
+		match &self.kind {
+			#[cfg(feature = "chain-esplora")]
+			ChainSourceKind::Esplora(_) => false,
+			#[cfg(feature = "chain-electrum")]
+			ChainSourceKind::Electrum(_) => false,
+			#[cfg(feature = "chain-bitcoind")]
+			ChainSourceKind::Bitcoind(_) => true,
+		}
+	}
+
+	#[cfg_attr(not(feature = "chain-bitcoind"), allow(unused_variables))]
 	pub(crate) async fn can_broadcast_transaction(&self, tx: &Transaction) -> Result<bool, Error> {
 		match &self.kind {
-			ChainSourceKind::Bitcoind(bitcoind_chain_source) => {
-				bitcoind_chain_source.can_broadcast_transaction(tx).await
-			},
-			ChainSourceKind::Esplora { .. } | ChainSourceKind::Electrum { .. } => {
-				// Neither supports a `testmempoolaccept` equivalent.
-				Err(Error::ChainSourceNotSupported)
-			},
+			#[cfg(feature = "chain-esplora")]
+			ChainSourceKind::Esplora(_) => Err(Error::ChainSourceNotSupported),
+			#[cfg(feature = "chain-electrum")]
+			ChainSourceKind::Electrum(_) => Err(Error::ChainSourceNotSupported),
+			#[cfg(feature = "chain-bitcoind")]
+			ChainSourceKind::Bitcoind(b) => b.can_broadcast_transaction(tx).await,
 		}
 	}
 }

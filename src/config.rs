@@ -241,6 +241,7 @@ pub(crate) const PAYJOIN_MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub(crate) const PAYJOIN_RELAY_TIMEOUT_SECS: u64 = 60;
 
 // The default timeout after which we abort a transaction lookup operation.
+#[cfg(feature = "chain-bitcoind")]
 pub(crate) const DEFAULT_TX_LOOKUP_TIMEOUT_SECS: u64 = 10;
 
 /// The mode used for tracking forwarded payments.

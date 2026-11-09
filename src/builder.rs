@@ -2537,7 +2537,7 @@ fn build_with_store_internal(
 	let pathfinding_scores_sync_url = pathfinding_scores_sync_config.map(|c| c.url.clone());
 
 	let payjoin_manager = if config.payjoin_config.is_some() {
-		if !matches!(chain_data_source_config, Some(ChainDataSourceConfig::Bitcoind { .. })) {
+		if !chain_source.supports_payjoin() {
 			return Err(BuildError::PayjoinConfigMismatch);
 		}
 
