@@ -90,6 +90,19 @@ pub(crate) enum FundingAmount {
 	Max,
 }
 
+/// Where a payjoin fallback transaction stands, as returned by
+/// [`Wallet::payjoin_fallback_status`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PayjoinFallbackStatus {
+	/// Neither the fallback nor a transaction double-spending it has confirmed through
+	/// [`ANTI_REORG_DELAY`], so the fallback may still need broadcasting.
+	Unresolved,
+	/// The fallback confirmed through [`ANTI_REORG_DELAY`].
+	Confirmed,
+	/// This transaction, double-spending the fallback, confirmed through [`ANTI_REORG_DELAY`].
+	Conflicted(Transaction),
+}
+
 mod payment_stores;
 pub(crate) mod persist;
 pub(crate) mod provenance;
@@ -3164,6 +3177,34 @@ impl Wallet {
 			})
 			.await?;
 		Ok(())
+	}
+
+	/// The hash of the wallet's chain tip.
+	pub(crate) fn best_block_hash(&self) -> bitcoin::BlockHash {
+		self.inner.lock().expect("lock").latest_checkpoint().hash()
+	}
+
+	/// Reports whether a payjoin fallback transaction still needs broadcasting.
+	///
+	/// The fallback spends the sender's inputs and pays us, so wallet sync picks it up, as it does
+	/// any competing spend of the sender's inputs that also pays us, such as the payjoin itself. A
+	/// competing spend paying only others never enters the wallet's graph, so to the wallet it
+	/// leaves the fallback unresolved.
+	pub(crate) fn payjoin_fallback_status(
+		&self, fallback_tx: &Transaction,
+	) -> PayjoinFallbackStatus {
+		let spends = self.spends_of_outpoints(fallback_tx.input.iter().map(|i| i.previous_output));
+		// Most confirmed first, so only the first can be buried deep enough.
+		match spends.into_iter().next() {
+			Some((tx, confirmations)) if confirmations >= ANTI_REORG_DELAY => {
+				if tx.compute_txid() == fallback_tx.compute_txid() {
+					PayjoinFallbackStatus::Confirmed
+				} else {
+					PayjoinFallbackStatus::Conflicted(tx)
+				}
+			},
+			_ => PayjoinFallbackStatus::Unresolved,
+		}
 	}
 
 	/// Records a funding payment the way the node does: the rounds this node signed supply the
@@ -10548,5 +10589,46 @@ mod tests {
 		let payment =
 			wallet.payment_stores.payment_store().get(&payment_id).await.unwrap().unwrap();
 		assert_eq!(payment.status, PaymentStatus::Pending);
+	}
+
+	#[tokio::test]
+	async fn payjoin_fallback_stays_unresolved_until_buried() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+		let fallback = tx_spending(&wallet, payjoin_sender_outpoints()[0]);
+
+		// Not yet seen by wallet sync.
+		assert_eq!(wallet.payjoin_fallback_status(&fallback), PayjoinFallbackStatus::Unresolved);
+
+		insert_unconfirmed_tx(&wallet, fallback.clone());
+		assert_eq!(wallet.payjoin_fallback_status(&fallback), PayjoinFallbackStatus::Unresolved);
+
+		insert_confirmed_tx(&wallet, fallback.clone(), 10);
+		set_chain_tip(&wallet, 10 + ANTI_REORG_DELAY - 2);
+		assert_eq!(wallet.payjoin_fallback_status(&fallback), PayjoinFallbackStatus::Unresolved);
+
+		set_chain_tip(&wallet, 10 + ANTI_REORG_DELAY - 1);
+		assert_eq!(wallet.payjoin_fallback_status(&fallback), PayjoinFallbackStatus::Confirmed);
+	}
+
+	#[tokio::test]
+	async fn payjoin_fallback_is_conflicted_by_a_buried_double_spend() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+		let fallback = tx_spending(&wallet, payjoin_sender_outpoints()[0]);
+		// A different transaction spending the same sender input, such as the payjoin.
+		let payjoin = tx_spending(&wallet, payjoin_sender_outpoints()[0]);
+		let payjoin_txid = payjoin.compute_txid();
+		assert_ne!(payjoin_txid, fallback.compute_txid());
+
+		insert_confirmed_tx(&wallet, payjoin.clone(), 10);
+		set_chain_tip(&wallet, 10 + ANTI_REORG_DELAY - 2);
+		assert_eq!(wallet.payjoin_fallback_status(&fallback), PayjoinFallbackStatus::Unresolved);
+
+		set_chain_tip(&wallet, 10 + ANTI_REORG_DELAY - 1);
+		assert_eq!(
+			wallet.payjoin_fallback_status(&fallback),
+			PayjoinFallbackStatus::Conflicted(payjoin)
+		);
 	}
 }

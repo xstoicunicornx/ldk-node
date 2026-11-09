@@ -95,6 +95,9 @@ pub enum PayjoinStatus {
 	Completed,
 	/// The session has failed
 	Failed,
+	/// The payjoin didn't complete and the sender's fallback transaction is rebroadcast until it,
+	/// or a transaction double-spending it, confirms
+	FallbackPending,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,7 +116,8 @@ impl_writeable_tlv_based!(SerializedSessionEvent, {
 impl_writeable_tlv_based_enum!(PayjoinStatus,
 	(0, Active) => {},
 	(2, Completed) => {},
-	(4, Failed) => {}
+	(4, Failed) => {},
+	(6, FallbackPending) => {}
 );
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -232,6 +236,18 @@ mod tests {
 
 		let decoded = PayjoinSession::read(&mut &session.encode()[..]).unwrap();
 		assert_eq!(decoded, session);
+		assert_eq!(decoded.fallback_tx(), Some(&dummy_tx()));
+	}
+
+	#[test]
+	fn fallback_pending_session_round_trips() {
+		let mut session = PayjoinSession::new(PaymentId([8; 32]), PayjoinSessionKind::Receive);
+		session.set_fallback_tx(dummy_tx());
+		session.status = PayjoinStatus::FallbackPending;
+		session.completed_at = Some(44);
+
+		let decoded = PayjoinSession::read(&mut &session.encode()[..]).unwrap();
+		assert_eq!(decoded.status, PayjoinStatus::FallbackPending);
 		assert_eq!(decoded.fallback_tx(), Some(&dummy_tx()));
 	}
 }

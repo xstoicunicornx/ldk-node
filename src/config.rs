@@ -231,6 +231,11 @@ pub(crate) const PAYJOIN_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 // The duration after which completed or failed payjoin sessions are cleaned up (24 hours).
 pub(crate) const PAYJOIN_SESSION_CLEANUP_AGE_SECS: u64 = 24 * 60 * 60;
 
+// How long we keep rebroadcasting a payjoin fallback transaction that neither confirms nor is seen
+// double-spent (1 week). The sender may have double-spent it to someone else, which the wallet
+// never sees.
+pub(crate) const PAYJOIN_FALLBACK_REBROADCAST_TIMEOUT_SECS: u64 = 7 * 24 * 60 * 60;
+
 // The interval at which we check for old payjoin sessions to clean up (1 hour).
 pub(crate) const PAYJOIN_SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
