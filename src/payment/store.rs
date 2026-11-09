@@ -16,7 +16,7 @@ use lightning::offers::offer::OfferId;
 use lightning::util::ser::{Readable, Writeable};
 use lightning::{
 	_init_and_read_len_prefixed_tlv_fields, impl_writeable_tlv_based,
-	impl_writeable_tlv_based_enum, write_tlv_fields,
+	impl_writeable_tlv_based_enum, impl_writeable_tlv_based_enum_upgradable, write_tlv_fields,
 };
 use lightning_types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
 use lightning_types::string::UntrustedString;
@@ -490,7 +490,7 @@ pub enum TransactionType {
 	},
 }
 
-impl_writeable_tlv_based_enum!(TransactionType,
+impl_writeable_tlv_based_enum_upgradable!(TransactionType,
 	(0, Funding) => {
 		(0, channels, optional_vec),
 	},
@@ -639,7 +639,7 @@ impl PaymentKind {
 impl_writeable_tlv_based_enum!(PaymentKind,
 	(0, Onchain) => {
 		(0, txid, required),
-		(1, tx_type, option),
+		(1, tx_type, upgradable_option),
 		(2, status, required),
 	},
 	(2, Bolt11) => {
@@ -1184,6 +1184,41 @@ mod tests {
 		let reencoded = decoded.encode();
 		assert_eq!(reencoded[0], 2);
 		assert_eq!(decoded, PaymentKind::read(&mut &*reencoded).unwrap());
+	}
+
+	#[test]
+	fn unknown_transaction_types_decode_by_parity() {
+		use bitcoin::hashes::Hash;
+
+		let kind = PaymentKind::Onchain {
+			txid: Txid::from_byte_array([0; 32]),
+			status: ConfirmationStatus::Unconfirmed,
+			tx_type: Some(TransactionType::Sweep { channels: Vec::new() }),
+		};
+		let encoded = kind.encode();
+		// The `tx_type` TLV: type 1, length 2, variant 10 (`Sweep`), an empty TLV stream.
+		let variant_pos = encoded.windows(4).position(|w| w == [1, 2, 10, 0]).unwrap() + 2;
+		let with_variant = |id: u8| {
+			let mut bytes = encoded.clone();
+			bytes[variant_pos] = id;
+			bytes
+		};
+
+		assert_eq!(PaymentKind::read(&mut &encoded[..]).unwrap(), kind);
+		// An unknown odd variant reads as unclassified.
+		assert_eq!(
+			PaymentKind::read(&mut &with_variant(15)[..]).unwrap(),
+			PaymentKind::Onchain {
+				txid: Txid::from_byte_array([0; 32]),
+				status: ConfirmationStatus::Unconfirmed,
+				tx_type: None,
+			}
+		);
+		// An unknown even variant is still required.
+		assert_eq!(
+			PaymentKind::read(&mut &with_variant(16)[..]),
+			Err(DecodeError::UnknownRequiredFeature)
+		);
 	}
 }
 
