@@ -1372,3 +1372,615 @@ impl PayjoinManager {
 		Ok(())
 	}
 }
+
+#[cfg(all(test, feature = "chain-esplora"))]
+mod tests {
+	use std::collections::HashMap;
+	use std::sync::atomic::{AtomicU8, Ordering};
+
+	use bitcoin::absolute::LockTime;
+	use bitcoin::hashes::Hash;
+	use bitcoin::transaction::Version;
+	use bitcoin::{
+		Address, Network, OutPoint, Psbt, ScriptBuf, Sequence, TxOut, WPubkeyHash, Witness,
+	};
+	use payjoin::persist::AsyncSessionPersister;
+	use payjoin::receive::v2::SessionEvent;
+	use serde_json::json;
+
+	use super::*;
+	use crate::config::EsploraSyncConfig;
+	use crate::data_store::KeepAllEntries;
+	use crate::io::test_utils::InMemoryStore;
+	use crate::payment::PaymentStatus;
+	use crate::payment::{PaymentDetails, PaymentKind};
+	use crate::types::{DynStore, DynStoreWrapper};
+	use crate::wallet::tests::{
+		insert_confirmed_tx, insert_unconfirmed_tx, new_test_wallet, observe_unconfirmed,
+		recorded_payment, set_chain_tip, tx_spending,
+	};
+	use crate::{NodeMetrics, PersistedNodeMetrics};
+
+	// Keys of a payjoin receiver session, from rust-payjoin's fuzzing seeds. Nothing in these tests
+	// encrypts with them.
+	const OHTTP_KEYS: [u8; 74] = [
+		1, 0, 22, 4, 49, 201, 65, 129, 251, 247, 128, 36, 159, 34, 170, 43, 131, 131, 10, 85, 25,
+		245, 236, 35, 252, 37, 128, 98, 22, 235, 48, 68, 122, 8, 134, 133, 12, 23, 164, 215, 191,
+		143, 99, 200, 11, 214, 16, 10, 31, 15, 91, 223, 101, 248, 218, 98, 90, 235, 190, 123, 14,
+		75, 237, 98, 32, 13, 77, 94, 0, 4, 0, 1, 0, 3,
+	];
+	const RECEIVER_SECRET_KEY: [u8; 32] = [
+		55, 181, 82, 181, 118, 112, 72, 22, 165, 165, 27, 49, 174, 138, 173, 154, 94, 222, 82, 73,
+		223, 101, 59, 62, 77, 184, 180, 205, 246, 246, 71, 92,
+	];
+	const RECEIVER_PUBLIC_KEY: [u8; 65] = [
+		4, 169, 112, 179, 223, 102, 152, 248, 70, 179, 203, 202, 47, 218, 92, 121, 173, 239, 35,
+		126, 66, 223, 96, 202, 36, 252, 93, 204, 223, 174, 107, 245, 243, 121, 135, 94, 243, 11,
+		133, 76, 46, 112, 47, 231, 239, 225, 227, 244, 123, 81, 171, 166, 150, 132, 192, 70, 169,
+		147, 114, 34, 202, 177, 177, 11, 236,
+	];
+	const SENDER_REPLY_KEY: [u8; 65] = [
+		4, 194, 221, 118, 65, 156, 207, 82, 35, 217, 201, 43, 116, 24, 169, 42, 61, 39, 244, 255,
+		112, 83, 209, 162, 36, 150, 230, 77, 40, 133, 173, 247, 186, 16, 202, 172, 58, 122, 210,
+		166, 77, 90, 183, 98, 94, 37, 82, 127, 92, 242, 127, 14, 208, 130, 137, 57, 186, 17, 229,
+		87, 40, 223, 13, 196, 243,
+	];
+
+	/// An expiration far enough out that sessions never expire mid-test (2100-01-01).
+	const NEVER_EXPIRES: u64 = 4_102_444_800;
+
+	/// What the sender pays us, out of each 200 000 sat input of theirs.
+	const PAYMENT_SATS: u64 = 100_000;
+	const SENDER_INPUT_SATS: u64 = 200_000;
+
+	struct Harness {
+		manager: PayjoinManager,
+		wallet: Arc<Wallet>,
+		broadcaster: Arc<Broadcaster>,
+		session_store: Arc<PayjoinSessionStore>,
+	}
+
+	/// A manager over a test wallet holding one confirmed UTXO, at chain tip 10, to contribute.
+	async fn harness() -> Harness {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(Arc::clone(&store), false).await;
+		let funding = tx_spending(&wallet, outpoint(0xf0, 0));
+		insert_confirmed_tx(&wallet, funding, 1);
+		set_chain_tip(&wallet, 10);
+
+		let logger = Arc::new(Logger::new_log_facade());
+		let mut config = Config::default();
+		config.network = Network::Regtest;
+		// Nothing listens on the relay, so a session that gets to posting fails to.
+		config.payjoin_config = Some(PayjoinConfig {
+			payjoin_directory: "https://example.com".to_string(),
+			ohttp_relays: vec!["http://127.0.0.1:1".to_string()],
+		});
+		let config = Arc::new(config);
+		let fee_estimator = Arc::new(OnchainFeeEstimator::new());
+		let broadcaster = Arc::new(Broadcaster::new(Arc::clone(&logger)));
+		// Only consulted for the broadcast suitability check, which these tests record directly.
+		let (chain_source, _) = ChainSource::new_esplora(
+			"http://localhost:1".to_string(),
+			HashMap::new(),
+			EsploraSyncConfig::default(),
+			Arc::clone(&fee_estimator),
+			Arc::clone(&broadcaster),
+			Arc::clone(&store),
+			Arc::clone(&config),
+			Arc::clone(&logger),
+			Arc::new(PersistedNodeMetrics::new(NodeMetrics::default())),
+		)
+		.unwrap();
+		let session_store = Arc::new(PayjoinSessionStore::new(
+			Vec::new(),
+			KeepAllEntries,
+			"payjoin_sessions".to_string(),
+			String::new(),
+			Arc::clone(&store),
+			Arc::clone(&logger),
+		));
+		let seen_inputs_store = Arc::new(PayjoinSeenInputsStore::new(
+			Vec::new(),
+			KeepAllEntries,
+			"payjoin_seen_inputs".to_string(),
+			String::new(),
+			Arc::clone(&store),
+			Arc::clone(&logger),
+		));
+		let manager = PayjoinManager::new(
+			Arc::clone(&session_store),
+			seen_inputs_store,
+			logger,
+			config,
+			Arc::clone(&wallet),
+			fee_estimator,
+			Arc::new(chain_source),
+			Arc::clone(&broadcaster),
+		);
+		Harness { manager, wallet, broadcaster, session_store }
+	}
+
+	fn outpoint(byte: u8, vout: u32) -> OutPoint {
+		OutPoint { txid: Txid::from_byte_array([byte; 32]), vout }
+	}
+
+	fn sender_script() -> ScriptBuf {
+		ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([7; 20]))
+	}
+
+	/// The sender's original transaction, paying us [`PAYMENT_SATS`] from `sender_inputs`, as a
+	/// finalized PSBT. Its signatures are placeholders: the receiver doesn't verify them.
+	fn original_psbt(address: &Address, sender_inputs: &[OutPoint]) -> Psbt {
+		let input_sats = SENDER_INPUT_SATS * sender_inputs.len() as u64;
+		let fee_sats = 1_000 * sender_inputs.len() as u64;
+		let tx = Transaction {
+			version: Version::TWO,
+			lock_time: LockTime::ZERO,
+			input: sender_inputs
+				.iter()
+				.map(|previous_output| TxIn {
+					previous_output: *previous_output,
+					sequence: Sequence::ENABLE_LOCKTIME_NO_RBF,
+					..Default::default()
+				})
+				.collect(),
+			output: vec![
+				TxOut {
+					value: Amount::from_sat(PAYMENT_SATS),
+					script_pubkey: address.script_pubkey(),
+				},
+				TxOut {
+					value: Amount::from_sat(input_sats - PAYMENT_SATS - fee_sats),
+					script_pubkey: sender_script(),
+				},
+			],
+		};
+		let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+		for input in psbt.inputs.iter_mut() {
+			input.witness_utxo = Some(TxOut {
+				value: Amount::from_sat(SENDER_INPUT_SATS),
+				script_pubkey: sender_script(),
+			});
+			input.final_script_witness = Some(Witness::from_slice(&[vec![0x30; 72], vec![2; 33]]));
+		}
+		psbt
+	}
+
+	fn event(value: serde_json::Value) -> SessionEvent {
+		serde_json::from_value(value).unwrap()
+	}
+
+	/// An event without data, e.g. `CheckedBroadcastSuitability()`.
+	fn unit_event(name: &str) -> SessionEvent {
+		serde_json::from_str(&format!("{{\"{}\":[]}}", name)).unwrap()
+	}
+
+	fn created_event(address: &Address, expiration: u64) -> SessionEvent {
+		event(json!({ "Created": {
+			"address": address.to_string(),
+			"directory": "https://example.com/",
+			"ohttp_keys": OHTTP_KEYS.to_vec(),
+			"expiration": expiration,
+			"amount": null,
+			"receiver_key": [RECEIVER_SECRET_KEY.to_vec(), RECEIVER_PUBLIC_KEY.to_vec()],
+			"reply_key": null,
+			// 100 sat/vB, so the fee for the input we contribute is never capped.
+			"max_fee_rate": 25_000,
+		}}))
+	}
+
+	fn retrieved_original_event(original: &Psbt) -> SessionEvent {
+		event(json!({ "RetrievedOriginalPayload": {
+			"original": {
+				"psbt": original,
+				"params": {
+					"v": 2,
+					"output_substitution": "Enabled",
+					"additional_fee_contribution": null,
+					"min_fee_rate": 250,
+				},
+			},
+			"reply_key": SENDER_REPLY_KEY.to_vec(),
+		}}))
+	}
+
+	/// A receive session the sender sent its original transaction to.
+	struct TestSession {
+		session_id: PaymentId,
+		persister: KVStorePayjoinReceiverPersister,
+		fallback: Transaction,
+	}
+
+	fn new_session_id() -> PaymentId {
+		static NEXT: AtomicU8 = AtomicU8::new(1);
+		PaymentId([NEXT.fetch_add(1, Ordering::Relaxed); 32])
+	}
+
+	/// A session still waiting for the sender.
+	async fn initialized_session(h: &Harness) -> (PaymentId, KVStorePayjoinReceiverPersister) {
+		let session_id = new_session_id();
+		let persister =
+			KVStorePayjoinReceiverPersister::new(session_id, Arc::clone(&h.session_store));
+		let address = h.wallet.get_new_address().await.unwrap();
+		persister.save_event(created_event(&address, NEVER_EXPIRES)).await.unwrap();
+		(session_id, persister)
+	}
+
+	/// A session that received an original spending `sender_inputs` and passed the broadcast
+	/// suitability check, so it's in [`ReceiveSession::MaybeInputsOwned`], with its fallback
+	/// recorded as [`PayjoinManager::check_original_payload`] does.
+	async fn session_with_original(
+		h: &Harness, sender_inputs: &[OutPoint], expiration: u64,
+	) -> TestSession {
+		let session_id = new_session_id();
+		let persister =
+			KVStorePayjoinReceiverPersister::new(session_id, Arc::clone(&h.session_store));
+		let address = h.wallet.get_new_address().await.unwrap();
+		let original = original_psbt(&address, sender_inputs);
+		for event in [
+			created_event(&address, expiration),
+			retrieved_original_event(&original),
+			unit_event("CheckedBroadcastSuitability"),
+		] {
+			persister.save_event(event).await.unwrap();
+		}
+		let fallback = original.extract_tx_unchecked_fee_rate();
+		let mut session = persister.get_session().await.unwrap();
+		session.set_fallback_tx(fallback.clone());
+		h.session_store.insert_or_update(session).await.unwrap();
+		TestSession { session_id, persister, fallback }
+	}
+
+	async fn replay(persister: &KVStorePayjoinReceiverPersister) -> ReceiveSession {
+		replay_receiver_event_log_async(persister).await.unwrap().0
+	}
+
+	/// Takes a session from [`ReceiveSession::MaybeInputsOwned`] through the manager's steps to
+	/// the proposal, then records it as posted, so it's in [`ReceiveSession::Monitor`]. Returns
+	/// the payjoin transaction as the sender would broadcast it.
+	async fn propose(h: &Harness, session: &TestSession) -> Transaction {
+		let persister = &session.persister;
+		let ReceiveSession::MaybeInputsOwned(proposal) = replay(persister).await else {
+			panic!("expected a session that got the sender's original");
+		};
+		let mut state = ReceiveSession::MaybeInputsOwned(proposal);
+		let payjoin_psbt = loop {
+			state = match state {
+				ReceiveSession::MaybeInputsOwned(p) => {
+					h.manager.check_inputs_not_owned(p, persister).await.unwrap()
+				},
+				ReceiveSession::MaybeInputsSeen(p) => {
+					h.manager.check_no_inputs_seen_before(p, persister).await.unwrap()
+				},
+				ReceiveSession::OutputsUnknown(p) => {
+					h.manager.identify_receiver_outputs(p, persister).await.unwrap()
+				},
+				ReceiveSession::WantsOutputs(p) => {
+					h.manager.commit_outputs(p, persister).await.unwrap()
+				},
+				ReceiveSession::WantsInputs(p) => {
+					h.manager.contribute_inputs(p, persister).await.unwrap()
+				},
+				ReceiveSession::WantsFeeRange(p) => {
+					h.manager.apply_fee_range(p, persister).await.unwrap()
+				},
+				ReceiveSession::ProvisionalProposal(p) => {
+					h.manager.finalize_proposal(p, persister).await.unwrap()
+				},
+				ReceiveSession::PayjoinProposal(p) => break p.psbt().clone(),
+				other => panic!("unexpected state {:?}", other),
+			};
+		};
+		persister.save_event(unit_event("PostedPayjoinProposal")).await.unwrap();
+		assert!(matches!(replay(persister).await, ReceiveSession::Monitor(_)));
+		payjoin_psbt.extract_tx_unchecked_fee_rate()
+	}
+
+	async fn status(h: &Harness, session_id: PaymentId) -> PayjoinSessionStatus {
+		h.manager.session_status(session_id).await.unwrap().unwrap()
+	}
+
+	/// Resumes the session as the resume task does.
+	async fn resume(h: &Harness, persister: &KVStorePayjoinReceiverPersister) -> Result<(), Error> {
+		let state = replay(persister).await;
+		h.manager.process_receiver_session(state, persister).await
+	}
+
+	/// The transactions queued for broadcast.
+	async fn broadcast_txs(h: &Harness) -> Vec<Transaction> {
+		let mut txs = Vec::new();
+		while let Ok(package) =
+			tokio::time::timeout(Duration::from_millis(10), h.broadcaster.next_package()).await
+		{
+			txs.extend(package.into_sorted_transactions().into_inner());
+		}
+		txs
+	}
+
+	fn tx_type(payment: &PaymentDetails) -> Option<TransactionType> {
+		match &payment.kind {
+			PaymentKind::Onchain { tx_type, .. } => tx_type.clone(),
+			kind => panic!("unexpected kind {:?}", kind),
+		}
+	}
+
+	fn payment_id(txid: Txid) -> PaymentId {
+		PaymentId(txid.to_byte_array())
+	}
+
+	#[tokio::test]
+	async fn payjoin_settles_once_buried() {
+		let h = harness().await;
+		let session = session_with_original(&h, &[outpoint(1, 0)], NEVER_EXPIRES).await;
+		let payjoin = propose(&h, &session).await;
+		let payjoin_txid = payjoin.compute_txid();
+		// We contributed an input of ours.
+		assert_eq!(payjoin.input.len(), 2);
+
+		// Seen unconfirmed: tagged, but the session stays open.
+		insert_confirmed_tx(&h.wallet, payjoin, 11);
+		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 2);
+		resume(&h, &session.persister).await.unwrap();
+		assert_eq!(status(&h, session.session_id).await, PayjoinSessionStatus::Active);
+		let payment = recorded_payment(&h.wallet, &payment_id(payjoin_txid)).await.unwrap();
+		assert_eq!(tx_type(&payment), Some(TransactionType::Payjoin));
+
+		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 1);
+		resume(&h, &session.persister).await.unwrap();
+		assert_eq!(
+			status(&h, session.session_id).await,
+			PayjoinSessionStatus::Completed { txid: Some(payjoin_txid) }
+		);
+		assert!(matches!(
+			replay(&session.persister).await,
+			ReceiveSession::Closed(ReceiverSessionOutcome::PayjoinProposalSent)
+		));
+		// The sender's input is spent past the reorg bar, so it's forgotten.
+		assert!(h.manager.payjoin_seen_inputs_store.get(&outpoint(1, 0)).await.unwrap().is_none());
+		assert!(broadcast_txs(&h).await.is_empty());
+	}
+
+	#[tokio::test]
+	async fn session_backs_off_when_the_proposal_cant_be_posted() {
+		let h = harness().await;
+		let session = session_with_original(&h, &[outpoint(1, 0)], NEVER_EXPIRES).await;
+
+		// The relay is unreachable, so the session fails at posting the proposal it got to.
+		assert!(resume(&h, &session.persister).await.is_err());
+		assert!(matches!(replay(&session.persister).await, ReceiveSession::PayjoinProposal(_)));
+		assert_eq!(status(&h, session.session_id).await, PayjoinSessionStatus::Active);
+		assert!(h.manager.payjoin_seen_inputs_store.get(&outpoint(1, 0)).await.unwrap().is_some());
+	}
+
+	#[tokio::test]
+	async fn session_pauses_while_the_senders_inputs_are_spent_shallowly() {
+		let h = harness().await;
+		let session = session_with_original(&h, &[outpoint(1, 0)], NEVER_EXPIRES).await;
+		// The sender gave up on the payjoin and broadcast its original.
+		insert_unconfirmed_tx(&h.wallet, session.fallback.clone());
+
+		resume(&h, &session.persister).await.unwrap();
+		// Nothing advanced: a proposal could no longer confirm.
+		assert!(matches!(replay(&session.persister).await, ReceiveSession::MaybeInputsOwned(_)));
+		assert_eq!(status(&h, session.session_id).await, PayjoinSessionStatus::Active);
+	}
+
+	#[tokio::test]
+	async fn buried_fallback_fails_the_session() {
+		let h = harness().await;
+		let session = session_with_original(&h, &[outpoint(1, 0)], NEVER_EXPIRES).await;
+		propose(&h, &session).await;
+		let fallback_txid = session.fallback.compute_txid();
+
+		insert_confirmed_tx(&h.wallet, session.fallback.clone(), 11);
+		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 1);
+		resume(&h, &session.persister).await.unwrap();
+
+		assert_eq!(
+			status(&h, session.session_id).await,
+			PayjoinSessionStatus::Failed { txid: Some(fallback_txid) }
+		);
+		assert!(matches!(replay(&session.persister).await, ReceiveSession::Closed(_)));
+		let payment = recorded_payment(&h.wallet, &payment_id(fallback_txid)).await;
+		assert!(payment.map_or(true, |payment| tx_type(&payment).is_none()));
+		assert!(h.manager.payjoin_seen_inputs_store.get(&outpoint(1, 0)).await.unwrap().is_none());
+		assert!(broadcast_txs(&h).await.is_empty());
+	}
+
+	#[tokio::test]
+	async fn unrecognized_spend_forgets_only_the_inputs_it_spends() {
+		let h = harness().await;
+		let (spent, unspent) = (outpoint(1, 0), outpoint(2, 0));
+		let session = session_with_original(&h, &[spent, unspent], NEVER_EXPIRES).await;
+		propose(&h, &session).await;
+
+		// The sender double-spent one of its inputs to us in some other transaction.
+		let double_spend = tx_spending(&h.wallet, spent);
+		insert_confirmed_tx(&h.wallet, double_spend.clone(), 11);
+		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 1);
+		resume(&h, &session.persister).await.unwrap();
+
+		assert_eq!(
+			status(&h, session.session_id).await,
+			PayjoinSessionStatus::Failed { txid: Some(double_spend.compute_txid()) }
+		);
+		assert!(h.manager.payjoin_seen_inputs_store.get(&spent).await.unwrap().is_none());
+		assert!(h.manager.payjoin_seen_inputs_store.get(&unspent).await.unwrap().is_some());
+	}
+
+	#[tokio::test]
+	async fn payjoin_replaced_by_the_fallback_has_its_payment_failed() {
+		let h = harness().await;
+		let session = session_with_original(&h, &[outpoint(1, 0)], NEVER_EXPIRES).await;
+		let payjoin = propose(&h, &session).await;
+		let payjoin_id = payment_id(payjoin.compute_txid());
+		let fallback_txid = session.fallback.compute_txid();
+
+		observe_unconfirmed(&h.wallet, &payjoin).await;
+		resume(&h, &session.persister).await.unwrap();
+		let payment = recorded_payment(&h.wallet, &payjoin_id).await.unwrap();
+		assert_eq!(tx_type(&payment), Some(TransactionType::Payjoin));
+		assert_eq!(payment.status, PaymentStatus::Pending);
+
+		// The fallback confirms instead, e.g. after a reorg, and the payjoin can't any more.
+		insert_confirmed_tx(&h.wallet, session.fallback.clone(), 11);
+		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 1);
+		resume(&h, &session.persister).await.unwrap();
+
+		assert_eq!(
+			status(&h, session.session_id).await,
+			PayjoinSessionStatus::Failed { txid: Some(fallback_txid) }
+		);
+		let payment = recorded_payment(&h.wallet, &payjoin_id).await.unwrap();
+		assert_eq!(payment.status, PaymentStatus::Failed);
+		assert_eq!(tx_type(&payment), Some(TransactionType::Payjoin));
+	}
+
+	#[tokio::test]
+	async fn cancelled_session_without_original_closes_without_broadcast() {
+		let h = harness().await;
+		let (session_id, persister) = initialized_session(&h).await;
+
+		h.manager.cancel_session(session_id).await.unwrap();
+		// Applied by the resume task, not by the request.
+		assert_eq!(status(&h, session_id).await, PayjoinSessionStatus::Active);
+
+		resume(&h, &persister).await.unwrap();
+		assert_eq!(
+			status(&h, session_id).await,
+			PayjoinSessionStatus::Cancelled { fallback_txid: None }
+		);
+		assert!(matches!(
+			replay(&persister).await,
+			ReceiveSession::Closed(ReceiverSessionOutcome::Aborted)
+		));
+		assert!(broadcast_txs(&h).await.is_empty());
+	}
+
+	#[tokio::test]
+	async fn cancelled_session_after_proposal_broadcasts_the_fallback() {
+		let h = harness().await;
+		let session = session_with_original(&h, &[outpoint(1, 0)], NEVER_EXPIRES).await;
+		propose(&h, &session).await;
+
+		h.manager.cancel_session(session.session_id).await.unwrap();
+		// Cancelling again is a no-op.
+		h.manager.cancel_session(session.session_id).await.unwrap();
+		resume(&h, &session.persister).await.unwrap();
+
+		assert_eq!(
+			status(&h, session.session_id).await,
+			PayjoinSessionStatus::Cancelled {
+				fallback_txid: Some(session.fallback.compute_txid())
+			}
+		);
+		assert_eq!(broadcast_txs(&h).await, vec![session.fallback.clone()]);
+		assert!(matches!(replay(&session.persister).await, ReceiveSession::Closed(_)));
+	}
+
+	#[tokio::test]
+	async fn cancel_is_refused_once_it_cant_change_the_outcome() {
+		let h = harness().await;
+		assert!(matches!(
+			h.manager.cancel_session(new_session_id()).await,
+			Err(Error::InvalidPaymentId)
+		));
+
+		// A spend of the sender's inputs was seen.
+		let session = session_with_original(&h, &[outpoint(1, 0)], NEVER_EXPIRES).await;
+		insert_unconfirmed_tx(&h.wallet, session.fallback.clone());
+		assert!(matches!(
+			h.manager.cancel_session(session.session_id).await,
+			Err(Error::PayjoinSessionNotCancellable)
+		));
+
+		// The session ended.
+		let session = session_with_original(&h, &[outpoint(2, 0)], NEVER_EXPIRES).await;
+		let payjoin = propose(&h, &session).await;
+		insert_confirmed_tx(&h.wallet, payjoin, 11);
+		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 1);
+		resume(&h, &session.persister).await.unwrap();
+		assert!(matches!(
+			h.manager.cancel_session(session.session_id).await,
+			Err(Error::PayjoinSessionNotCancellable)
+		));
+	}
+
+	#[tokio::test]
+	async fn expired_session_rebroadcasts_its_fallback_until_buried() {
+		let h = harness().await;
+		// Expired in 2020.
+		let session = session_with_original(&h, &[outpoint(1, 0)], 1_600_000_000).await;
+		let fallback_txid = session.fallback.compute_txid();
+
+		let (_stop_sender, stop_receiver) = tokio::sync::watch::channel(());
+		h.manager.resume_payjoin_sessions(stop_receiver).await.unwrap();
+		assert_eq!(
+			status(&h, session.session_id).await,
+			PayjoinSessionStatus::FallbackPending { fallback_txid }
+		);
+		assert_eq!(broadcast_txs(&h).await, vec![session.fallback.clone()]);
+
+		// The first pass after startup rebroadcasts, and then once per chain tip.
+		h.manager.rebroadcast_pending_fallbacks().await;
+		assert_eq!(broadcast_txs(&h).await, vec![session.fallback.clone()]);
+		h.manager.rebroadcast_pending_fallbacks().await;
+		assert!(broadcast_txs(&h).await.is_empty());
+
+		insert_confirmed_tx(&h.wallet, session.fallback.clone(), 11);
+		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 1);
+		h.manager.rebroadcast_pending_fallbacks().await;
+		assert_eq!(
+			status(&h, session.session_id).await,
+			PayjoinSessionStatus::Failed { txid: Some(fallback_txid) }
+		);
+		assert!(broadcast_txs(&h).await.is_empty());
+	}
+
+	#[tokio::test]
+	async fn pending_fallback_beaten_by_the_payjoin_has_its_payment_failed() {
+		let h = harness().await;
+		let session = session_with_original(&h, &[outpoint(1, 0)], NEVER_EXPIRES).await;
+		let payjoin = propose(&h, &session).await;
+		let payjoin_txid = payjoin.compute_txid();
+		let fallback_id = payment_id(session.fallback.compute_txid());
+
+		// Cancelled, so we broadcast the fallback, which wallet sync records.
+		h.manager.cancel_session(session.session_id).await.unwrap();
+		resume(&h, &session.persister).await.unwrap();
+		observe_unconfirmed(&h.wallet, &session.fallback).await;
+		assert_eq!(
+			recorded_payment(&h.wallet, &fallback_id).await.unwrap().status,
+			PaymentStatus::Pending
+		);
+
+		// But the sender broadcast the payjoin it had, which confirms.
+		insert_confirmed_tx(&h.wallet, payjoin, 11);
+		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 1);
+		h.manager.rebroadcast_pending_fallbacks().await;
+
+		let recorded = h.session_store.get(&session.session_id).await.unwrap().unwrap();
+		assert_eq!(recorded.status, PayjoinStatus::Failed);
+		assert_eq!(recorded.resolution_txid, Some(payjoin_txid));
+		assert_eq!(
+			recorded_payment(&h.wallet, &fallback_id).await.unwrap().status,
+			PaymentStatus::Failed
+		);
+	}
+
+	#[tokio::test]
+	async fn cleanup_forgets_seen_inputs_past_retention() {
+		let h = harness().await;
+		let (old, recent) = (outpoint(1, 0), outpoint(2, 0));
+		let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+		let store = &h.manager.payjoin_seen_inputs_store;
+		let first_seen = now - PAYJOIN_SEEN_INPUT_RETENTION_SECS - 1;
+		check_and_record_seen_input(store, old, new_session_id(), first_seen).await.unwrap();
+		check_and_record_seen_input(store, recent, new_session_id(), now).await.unwrap();
+
+		h.manager.cleanup_old_sessions().await.unwrap();
+		assert!(store.get(&old).await.unwrap().is_none());
+		assert!(store.get(&recent).await.unwrap().is_some());
+	}
+}

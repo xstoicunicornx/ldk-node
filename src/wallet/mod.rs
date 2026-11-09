@@ -4438,7 +4438,7 @@ fn ldk_to_bdk_satisfaction_weight(ldk_satisfaction_weight: u64) -> Weight {
 }
 
 #[cfg(all(test, any(feature = "chain-esplora", feature = "chain-electrum")))]
-mod tests {
+pub(crate) mod tests {
 	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 	use bdk_chain::{BlockId, CheckPoint, ConfirmationBlockTime, TxUpdate};
@@ -4642,7 +4642,7 @@ mod tests {
 
 	/// Constructs a `Wallet` around the given store, either creating a fresh BDK wallet or
 	/// loading the one the store already holds.
-	async fn new_test_wallet(store: Arc<DynStore>, load_existing: bool) -> Arc<Wallet> {
+	pub(crate) async fn new_test_wallet(store: Arc<DynStore>, load_existing: bool) -> Arc<Wallet> {
 		let logger = Arc::new(Logger::new_log_facade());
 		let mut config = Config::default();
 		config.network = Network::Regtest;
@@ -5508,7 +5508,7 @@ mod tests {
 
 	/// Inserts `tx` into the BDK wallet as canonically confirmed at `height`, extending the
 	/// local chain to that height.
-	fn insert_confirmed_tx(wallet: &Wallet, tx: Transaction, height: u32) {
+	pub(crate) fn insert_confirmed_tx(wallet: &Wallet, tx: Transaction, height: u32) {
 		let txid = tx.compute_txid();
 		let mut locked = wallet.inner.lock().unwrap();
 		let block =
@@ -5523,8 +5523,15 @@ mod tests {
 			.unwrap();
 	}
 
+	/// The payment recorded under `payment_id`, for tests outside this module.
+	pub(crate) async fn recorded_payment(
+		wallet: &Wallet, payment_id: &PaymentId,
+	) -> Option<PaymentDetails> {
+		wallet.payment_stores.payment_store().get(payment_id).await.unwrap()
+	}
+
 	/// Inserts `tx` into the BDK wallet as canonically unconfirmed (seen in the mempool).
-	fn insert_unconfirmed_tx(wallet: &Wallet, tx: Transaction) {
+	pub(crate) fn insert_unconfirmed_tx(wallet: &Wallet, tx: Transaction) {
 		let txid = tx.compute_txid();
 		let mut locked = wallet.inner.lock().unwrap();
 		let mut tx_update = bdk_chain::TxUpdate::default();
@@ -5535,7 +5542,7 @@ mod tests {
 
 	/// Marks `txid` as evicted from the mempool after it was seen, so the BDK wallet still has
 	/// the transaction but no longer considers it canonical.
-	fn evict_tx(wallet: &Wallet, txid: Txid) {
+	pub(crate) fn evict_tx(wallet: &Wallet, txid: Txid) {
 		let mut locked = wallet.inner.lock().unwrap();
 		let mut tx_update = bdk_chain::TxUpdate::default();
 		tx_update.evicted_ats = [(txid, 101)].into();
@@ -5598,7 +5605,7 @@ mod tests {
 
 	/// Lets wallet sync observe `tx` as an unconfirmed wallet transaction: the wallet takes it in
 	/// and the sync event it yields is handled.
-	async fn observe_unconfirmed(wallet: &Wallet, tx: &Transaction) {
+	pub(crate) async fn observe_unconfirmed(wallet: &Wallet, tx: &Transaction) {
 		insert_unconfirmed_tx(wallet, tx.clone());
 		let event = WalletEvent::TxUnconfirmed {
 			txid: tx.compute_txid(),
@@ -9950,7 +9957,7 @@ mod tests {
 	}
 
 	/// Builds a transaction spending `outpoint` into the wallet.
-	fn tx_spending(wallet: &Wallet, outpoint: OutPoint) -> Transaction {
+	pub(crate) fn tx_spending(wallet: &Wallet, outpoint: OutPoint) -> Transaction {
 		let script_pubkey = wallet
 			.inner
 			.lock()
@@ -9990,7 +9997,7 @@ mod tests {
 	}
 
 	/// Moves the wallet's chain tip to `height` without running the chain tip pass.
-	fn set_chain_tip(wallet: &Wallet, height: u32) {
+	pub(crate) fn set_chain_tip(wallet: &Wallet, height: u32) {
 		let mut locked = wallet.inner.lock().unwrap();
 		let chain = locked.latest_checkpoint().insert(block_id_at(height));
 		locked.apply_update(Update { chain: Some(chain), ..Default::default() }).unwrap();
