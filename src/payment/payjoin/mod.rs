@@ -14,9 +14,45 @@ pub(crate) mod seen_inputs;
 
 use std::sync::{Arc, RwLock};
 
+use bitcoin::Txid;
+use lightning::ln::channelmanager::PaymentId;
 pub use manager::PayjoinReceiveSession;
 
 use crate::{error::Error, payment::payjoin::manager::PayjoinManager};
+
+/// The status of a Payjoin receive session, as returned by [`PayjoinPayment::status`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
+pub enum PayjoinSessionStatus {
+	/// The session is waiting on the sender, or on a transaction spending the sender's inputs to
+	/// confirm. A session whose cancellation was requested stays active until it is applied.
+	Active,
+	/// The payjoin transaction confirmed and the session completed.
+	Completed {
+		/// The payjoin transaction, if known. It is only unknown for a session closed by an
+		/// outcome that doesn't name the transaction, which this node doesn't record.
+		txid: Option<Txid>,
+	},
+	/// The payjoin didn't complete, so the sender's fallback transaction pays instead. It is
+	/// rebroadcast until it, or another spend of the sender's inputs, confirms.
+	FallbackPending {
+		/// The sender's fallback transaction.
+		fallback_txid: Txid,
+	},
+	/// The payjoin didn't complete.
+	Failed {
+		/// The transaction that settled the session: the sender's fallback, or another spend of
+		/// the sender's inputs. `None` if none was seen, e.g. because the session ended before
+		/// the sender sent its original transaction, or the fallback was given up on.
+		txid: Option<Txid>,
+	},
+	/// The session was cancelled through [`PayjoinPayment::cancel`] and didn't complete.
+	Cancelled {
+		/// The sender's fallback transaction, if the session had received it. It is then
+		/// broadcast and rebroadcast until it, or another spend of the sender's inputs, confirms.
+		fallback_txid: Option<Txid>,
+	},
+}
 
 #[cfg(not(feature = "uniffi"))]
 type FeeRate = bitcoin::FeeRate;
@@ -81,5 +117,40 @@ impl PayjoinPayment {
 
 		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
 		manager.receive_payjoin(amount_sats, fee_rate_opt).await
+	}
+
+	/// Returns the status of the receive session `session_id`, as returned by [`Self::receive`].
+	///
+	/// Returns `None` for an unknown session. A session that completed, failed or was cancelled
+	/// is forgotten a day after it ended, while its payment stays in the payment store.
+	///
+	/// Returns [`Error::PayjoinNotConfigured`] if no [`PayjoinConfig`] was set.
+	///
+	/// [`PayjoinConfig`]: crate::config::PayjoinConfig
+	pub async fn status(
+		&self, session_id: PaymentId,
+	) -> Result<Option<PayjoinSessionStatus>, Error> {
+		let manager = self.manager.as_ref().ok_or(Error::PayjoinNotConfigured)?;
+		manager.session_status(session_id).await
+	}
+
+	/// Cancels the receive session `session_id`, as returned by [`Self::receive`].
+	///
+	/// The cancellation is applied in the background, so [`Self::status`] reports the session as
+	/// active until it is, and as [`PayjoinSessionStatus::Cancelled`] afterwards. If the session
+	/// already received the sender's original transaction, that transaction is broadcast so that
+	/// we still get paid. Cancelling a session again has no further effect.
+	///
+	/// Returns [`Error::InvalidPaymentId`] for an unknown session, and
+	/// [`Error::PayjoinSessionNotCancellable`] if the session already ended, or if a transaction
+	/// spending the sender's inputs was already seen, so that cancelling can't change how it
+	/// settles.
+	///
+	/// Returns [`Error::PayjoinNotConfigured`] if no [`PayjoinConfig`] was set.
+	///
+	/// [`PayjoinConfig`]: crate::config::PayjoinConfig
+	pub async fn cancel(&self, session_id: PaymentId) -> Result<(), Error> {
+		let manager = self.manager.as_ref().ok_or(Error::PayjoinNotConfigured)?;
+		manager.cancel_session(session_id).await
 	}
 }

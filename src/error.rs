@@ -161,6 +161,8 @@ pub enum Error {
 	PayjoinSessionCreationFailed,
 	/// Payjoin session failed.
 	PayjoinSessionFailed,
+	/// The payjoin session can no longer be cancelled.
+	PayjoinSessionNotCancellable,
 }
 
 impl fmt::Display for Error {
@@ -264,6 +266,9 @@ impl fmt::Display for Error {
 			Self::PayjoinNotConfigured => write!(f, "Payjoin is not configured."),
 			Self::PayjoinSessionCreationFailed => write!(f, "Payjoin session creation failed."),
 			Self::PayjoinSessionFailed => write!(f, "Payjoin session failed."),
+			Self::PayjoinSessionNotCancellable => {
+				write!(f, "The payjoin session can no longer be cancelled.")
+			},
 		}
 	}
 }

@@ -223,6 +223,7 @@ enum NodeError {
 	"PayjoinNotConfigured",
 	"PayjoinSessionCreationFailed",
 	"PayjoinSessionFailed",
+	"PayjoinSessionNotCancellable",
 };
 
 typedef dictionary NodeStatus;
