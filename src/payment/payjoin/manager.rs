@@ -25,7 +25,6 @@ use payjoin::receive::v2::{
 	WantsInputs, WantsOutputs,
 };
 use payjoin::receive::InputPair;
-use payjoin::ImplementationError;
 
 use crate::chain::ChainSource;
 use crate::config::{
@@ -800,12 +799,17 @@ impl PayjoinManager {
 	async fn check_inputs_not_owned(
 		&self, proposal: Receiver<MaybeInputsOwned>, persister: &KVStorePayjoinReceiverPersister,
 	) -> Result<ReceiveSession, Error> {
+		let mut marked_checklist = Vec::new();
+		for item in proposal.inputs_owned_checklist() {
+			let owned = self.wallet.is_my_outpoint(item.value()).map_err(|e| {
+				log_error!(self.logger, "Failed to check whether a sender input is ours: {}", e);
+				e
+			})?;
+			marked_checklist.push(item.mark(owned));
+		}
+
 		let proposal = proposal
-			.check_inputs_not_owned(&mut |outpoint| {
-				self.wallet
-					.is_my_outpoint(&outpoint)
-					.map_err(|e| ImplementationError::from(e.to_string().as_str()))
-			})
+			.apply_inputs_owned_checklist(marked_checklist)
 			.save_async(persister)
 			.await
 			.map_err(|e| {
@@ -854,12 +858,17 @@ impl PayjoinManager {
 	async fn identify_receiver_outputs(
 		&self, proposal: Receiver<OutputsUnknown>, persister: &KVStorePayjoinReceiverPersister,
 	) -> Result<ReceiveSession, Error> {
+		let mut marked_checklist = Vec::new();
+		for item in proposal.outputs_owned_checklist() {
+			let owned = self.wallet.is_mine(item.value().clone()).map_err(|e| {
+				log_error!(self.logger, "Failed to check whether a proposal output is ours: {}", e);
+				e
+			})?;
+			marked_checklist.push(item.mark(owned));
+		}
+
 		let proposal = proposal
-			.identify_receiver_outputs(&mut |output_script| {
-				self.wallet
-					.is_mine(output_script.to_owned())
-					.map_err(|e| ImplementationError::from(e.to_string().as_str()))
-			})
+			.apply_outputs_owned_checklist(marked_checklist)
 			.save_async(persister)
 			.await
 			.map_err(|e| {
@@ -951,18 +960,15 @@ impl PayjoinManager {
 	async fn finalize_proposal(
 		&self, proposal: Receiver<ProvisionalProposal>, persister: &KVStorePayjoinReceiverPersister,
 	) -> Result<ReceiveSession, Error> {
-		let proposal = proposal
-			.finalize_proposal(|psbt| {
-				self.wallet
-					.process_psbt(psbt.clone())
-					.map_err(|e| ImplementationError::from(e.to_string().as_str()))
-			})
-			.save_async(persister)
-			.await
-			.map_err(|e| {
-				log_error!(self.logger, "Failed to finalize the payjoin proposal: {:?}", e);
-				Error::PersistenceFailed
-			})?;
+		let signed_psbt = self.wallet.process_psbt(proposal.psbt_to_sign())?;
+
+		let proposal =
+			proposal.finalize_signed_proposal(&signed_psbt).save_async(persister).await.map_err(
+				|e| {
+					log_error!(self.logger, "Failed to finalize the payjoin proposal: {:?}", e);
+					Error::PersistenceFailed
+				},
+			)?;
 		Ok(ReceiveSession::PayjoinProposal(proposal))
 	}
 
@@ -1925,6 +1931,20 @@ mod tests {
 		assert!(matches!(replay(&session.persister).await, ReceiveSession::PayjoinProposal(_)));
 		assert_eq!(status(&h, session.session_id).await, PayjoinSessionStatus::Active);
 		assert!(h.manager.payjoin_seen_inputs_store.get(&outpoint(1, 0)).await.unwrap().is_some());
+	}
+
+	#[tokio::test]
+	async fn original_spending_our_own_input_is_rejected() {
+		let h = harness().await;
+		let ours = h.wallet.list_unspent_confirmed_utxos().unwrap()[0].outpoint;
+		let session = session_with_original(&h, &[ours], NEVER_EXPIRES).await;
+		let ReceiveSession::MaybeInputsOwned(proposal) = replay(&session.persister).await else {
+			panic!("expected a session that got the sender's original");
+		};
+
+		// The rejection is saved, so the next resume replies to the sender with it.
+		assert!(h.manager.check_inputs_not_owned(proposal, &session.persister).await.is_err());
+		assert!(matches!(replay(&session.persister).await, ReceiveSession::HasReplyableError(_)));
 	}
 
 	#[tokio::test]
