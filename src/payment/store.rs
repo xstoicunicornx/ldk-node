@@ -519,7 +519,7 @@ impl_writeable_tlv_based_enum!(TransactionType,
 	(12, InteractiveFunding) => {
 		(0, channels, optional_vec),
 	},
-	(13, Payjoin) => {}
+	(14, Payjoin) => {}
 );
 
 /// Represents the kind of a payment.
