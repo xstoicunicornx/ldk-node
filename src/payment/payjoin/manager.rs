@@ -30,13 +30,16 @@ use payjoin::ImplementationError;
 use crate::chain::ChainSource;
 use crate::config::{
 	Config, PayjoinConfig, PAYJOIN_FALLBACK_REBROADCAST_TIMEOUT_SECS, PAYJOIN_MAX_RESPONSE_BYTES,
-	PAYJOIN_RELAY_TIMEOUT_SECS, PAYJOIN_RETRY_DELAY, PAYJOIN_SESSION_CLEANUP_AGE_SECS,
+	PAYJOIN_RELAY_TIMEOUT_SECS, PAYJOIN_RETRY_DELAY, PAYJOIN_SEEN_INPUT_RETENTION_SECS,
+	PAYJOIN_SESSION_CLEANUP_AGE_SECS,
 };
 use crate::fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
 use crate::payment::payjoin::payjoin_session::{PayjoinSession, PayjoinSessionKind, PayjoinStatus};
 use crate::payment::payjoin::persist::KVStorePayjoinReceiverPersister;
-use crate::payment::payjoin::seen_inputs::check_and_record_seen_input;
+use crate::payment::payjoin::seen_inputs::{
+	check_and_record_seen_input, forget_seen_inputs, prune_seen_inputs,
+};
 use crate::payment::payjoin::PayjoinSessionStatus;
 use crate::payment::store::TransactionType;
 
@@ -447,6 +450,7 @@ impl PayjoinManager {
 				.then_some(TransactionType::Payjoin);
 			self.wallet.fail_payment_lost_to_conflict(lost.compute_txid(), tx_type).await?;
 		}
+		self.forget_spent_sender_inputs(&tx, &fallback_tx).await;
 
 		// Our record goes first: resumption only picks up active sessions, so if persisting the
 		// close event fails afterwards, the session is still never replayed.
@@ -1189,6 +1193,7 @@ impl PayjoinManager {
 						fallback_txid,
 						session_id
 					);
+					self.forget_spent_sender_inputs(fallback_tx, fallback_tx).await;
 					if self.fail_lost_spends(fallback_tx, fallback_tx).await {
 						self.resolve_pending_fallback(session_id, Some(fallback_txid)).await;
 					}
@@ -1201,6 +1206,7 @@ impl PayjoinManager {
 						session_id,
 						winner.compute_txid()
 					);
+					self.forget_spent_sender_inputs(&winner, fallback_tx).await;
 					if self.fail_lost_spends(&winner, fallback_tx).await {
 						self.resolve_pending_fallback(session_id, Some(winner.compute_txid()))
 							.await;
@@ -1266,6 +1272,29 @@ impl PayjoinManager {
 		true
 	}
 
+	/// Forgets the seen sender inputs, which `fallback_tx` spends, that `winner` spends, now that
+	/// it's confirmed through [`ANTI_REORG_DELAY`]. An unrecognized `winner` may spend only some of
+	/// them, and the rest can still be reused to probe us.
+	///
+	/// Best effort: [`Self::cleanup_old_sessions`] forgets what this misses after
+	/// [`PAYJOIN_SEEN_INPUT_RETENTION_SECS`].
+	async fn forget_spent_sender_inputs(&self, winner: &Transaction, fallback_tx: &Transaction) {
+		let spent = fallback_tx
+			.input
+			.iter()
+			.map(|txin| txin.previous_output)
+			.filter(|sender| winner.input.iter().any(|txin| txin.previous_output == *sender))
+			.collect::<Vec<_>>();
+		if let Err(e) = forget_seen_inputs(&self.payjoin_seen_inputs_store, spent).await {
+			log_warn!(
+				self.logger,
+				"Failed to forget the payjoin sender inputs spent by {}: {:?}",
+				winner.compute_txid(),
+				e
+			);
+		}
+	}
+
 	/// Marks a [`PayjoinStatus::FallbackPending`] session [`PayjoinStatus::Failed`], ending the
 	/// rebroadcast of its fallback, and records `resolution_txid` as what settled it.
 	async fn resolve_pending_fallback(&self, session_id: PaymentId, resolution_txid: Option<Txid>) {
@@ -1297,6 +1326,20 @@ impl PayjoinManager {
 			.duration_since(std::time::UNIX_EPOCH)
 			.unwrap_or(std::time::Duration::from_secs(0))
 			.as_secs();
+
+		match prune_seen_inputs(
+			&self.payjoin_seen_inputs_store,
+			now,
+			PAYJOIN_SEEN_INPUT_RETENTION_SECS,
+		)
+		.await
+		{
+			Ok(0) => {},
+			Ok(pruned) => log_info!(self.logger, "Forgot {} old payjoin sender inputs", pruned),
+			Err(e) => {
+				log_error!(self.logger, "Failed to forget old payjoin sender inputs: {:?}", e)
+			},
+		}
 
 		let sessions_to_remove: Vec<PaymentId> = self
 			.payjoin_session_store

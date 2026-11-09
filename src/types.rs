@@ -348,7 +348,7 @@ pub(crate) type ChannelPairForwardingStatsStore =
 pub(crate) type ChannelTxFactsStore = DataStore<ChannelTxFacts, Arc<Logger>, KeepLeastRecentlyUsed>;
 
 pub(crate) type PayjoinSessionStore = DataStore<PayjoinSession, Arc<Logger>>;
-pub(crate) type PayjoinSeenInputsStore = DataStore<SeenInput, Arc<Logger>, KeepNoEntries>;
+pub(crate) type PayjoinSeenInputsStore = DataStore<SeenInput, Arc<Logger>, KeepAllEntries>;
 
 /// A local, potentially user-provided, identifier of a channel.
 ///

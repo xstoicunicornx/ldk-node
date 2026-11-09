@@ -63,7 +63,7 @@ use crate::config::{
 	PAYMENT_CACHE_WARMUP_COUNT,
 };
 use crate::connection::ConnectionManager;
-use crate::data_store::{KeepAllEntries, KeepLeastRecentlyUsed, KeepNoEntries};
+use crate::data_store::{KeepAllEntries, KeepLeastRecentlyUsed};
 use crate::entropy::NodeEntropy;
 use crate::event::EventQueue;
 use crate::fee_estimator::OnchainFeeEstimator;
@@ -1595,6 +1595,7 @@ fn build_with_store_internal(
 		channel_tx_facts_store_res,
 		address_pool_res,
 		payjoin_session_store_res,
+		payjoin_seen_inputs_res,
 	) = runtime.block_on(async move {
 		tokio::join!(
 			read_n_objects(
@@ -1629,6 +1630,12 @@ fn build_with_store_internal(
 				&*kv_store_ref,
 				PAYJOIN_SESSION_STORE_PRIMARY_NAMESPACE,
 				PAYJOIN_SESSION_STORE_SECONDARY_NAMESPACE,
+				Arc::clone(&logger_ref),
+			),
+			read_all_objects(
+				&*kv_store_ref,
+				PAYJOIN_SEEN_INPUTS_PRIMARY_NAMESPACE,
+				PAYJOIN_SEEN_INPUTS_SECONDARY_NAMESPACE,
 				Arc::clone(&logger_ref),
 			),
 		)
@@ -2556,14 +2563,22 @@ fn build_with_store_internal(
 			},
 		};
 
-		let payjoin_seen_inputs_store = Arc::new(PayjoinSeenInputsStore::new(
-			Vec::new(),
-			KeepNoEntries,
-			PAYJOIN_SEEN_INPUTS_PRIMARY_NAMESPACE.to_string(),
-			PAYJOIN_SEEN_INPUTS_SECONDARY_NAMESPACE.to_string(),
-			Arc::clone(&kv_store),
-			Arc::clone(&logger),
-		));
+		// Pruning keeps this to the inputs of the last `PAYJOIN_SEEN_INPUT_RETENTION_SECS` whose
+		// spend isn't buried yet, so it's all kept in memory.
+		let payjoin_seen_inputs_store = match payjoin_seen_inputs_res {
+			Ok(seen_inputs) => Arc::new(PayjoinSeenInputsStore::new(
+				seen_inputs,
+				KeepAllEntries,
+				PAYJOIN_SEEN_INPUTS_PRIMARY_NAMESPACE.to_string(),
+				PAYJOIN_SEEN_INPUTS_SECONDARY_NAMESPACE.to_string(),
+				Arc::clone(&kv_store),
+				Arc::clone(&logger),
+			)),
+			Err(e) => {
+				log_error!(logger, "Failed to read payjoin seen inputs from store: {}", e);
+				return Err(BuildError::ReadFailed);
+			},
+		};
 
 		Some(Arc::new(PayjoinManager::new(
 			Arc::clone(&payjoin_session_store),

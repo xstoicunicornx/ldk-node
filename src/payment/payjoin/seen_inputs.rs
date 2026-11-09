@@ -12,7 +12,7 @@ use bitcoin::{OutPoint, Txid};
 use lightning::impl_writeable_tlv_based;
 use lightning::ln::channelmanager::PaymentId;
 
-use crate::data_store::{DataStore, KeepNoEntries, StorableObject, StorableObjectId};
+use crate::data_store::{CachePolicy, DataStore, KeepAllEntries, StorableObject, StorableObjectId};
 use crate::logger::LdkLogger;
 use crate::Error;
 
@@ -66,9 +66,8 @@ impl StorableObject for SeenInput {
 ///
 /// The check and the insert happen atomically, so concurrent sessions racing on the same input
 /// can't both consider it unseen.
-pub(crate) async fn check_and_record_seen_input<L: Deref>(
-	store: &DataStore<SeenInput, L, KeepNoEntries>, outpoint: OutPoint, session_id: PaymentId,
-	now: u64,
+pub(crate) async fn check_and_record_seen_input<L: Deref, P: CachePolicy>(
+	store: &DataStore<SeenInput, L, P>, outpoint: OutPoint, session_id: PaymentId, now: u64,
 ) -> Result<bool, Error>
 where
 	L::Target: LdkLogger,
@@ -88,6 +87,44 @@ where
 	Ok(seen)
 }
 
+/// Forgets the sender inputs among `outpoints`, once a transaction spending them is buried.
+///
+/// A sender can't reuse a spent input to probe us any more: an original transaction spending it
+/// fails the broadcast suitability check, which comes before the check for seen inputs.
+pub(crate) async fn forget_seen_inputs<L: Deref, P: CachePolicy>(
+	store: &DataStore<SeenInput, L, P>, outpoints: impl IntoIterator<Item = OutPoint>,
+) -> Result<(), Error>
+where
+	L::Target: LdkLogger,
+{
+	for outpoint in outpoints {
+		store.remove(&outpoint).await?;
+	}
+	Ok(())
+}
+
+/// Forgets the sender inputs first seen more than `retention_secs` before `now`, whose spend was
+/// never seen buried, e.g. because the sender never broadcast or spent them to someone else.
+///
+/// Returns how many were forgotten.
+pub(crate) async fn prune_seen_inputs<L: Deref>(
+	store: &DataStore<SeenInput, L, KeepAllEntries>, now: u64, retention_secs: u64,
+) -> Result<usize, Error>
+where
+	L::Target: LdkLogger,
+{
+	let is_old =
+		|seen_input: &SeenInput| now.saturating_sub(seen_input.first_seen_at) > retention_secs;
+	let mut pruned = 0;
+	for seen_input in store.list_filter(|seen_input| is_old(seen_input)).await {
+		// Checked again under the lock, in case the input was forgotten and seen anew meanwhile.
+		if store.remove_if(&seen_input.outpoint, is_old).await? {
+			pruned += 1;
+		}
+	}
+	Ok(pruned)
+}
+
 #[cfg(test)]
 mod tests {
 	use std::sync::Arc;
@@ -99,11 +136,11 @@ mod tests {
 	use crate::io::test_utils::InMemoryStore;
 	use crate::types::{DynStore, DynStoreWrapper};
 
-	fn new_store() -> DataStore<SeenInput, Arc<TestLogger>, KeepNoEntries> {
+	fn new_store() -> DataStore<SeenInput, Arc<TestLogger>, KeepAllEntries> {
 		let kv_store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
 		DataStore::new(
 			Vec::new(),
-			KeepNoEntries,
+			KeepAllEntries,
 			"payjoin_seen_inputs_test".to_string(),
 			String::new(),
 			kv_store,
@@ -163,5 +200,39 @@ mod tests {
 		);
 		// Exactly one session gets to use the input.
 		assert_ne!(a.unwrap(), b.unwrap());
+	}
+
+	#[tokio::test]
+	async fn forgotten_inputs_can_be_seen_anew() {
+		let store = new_store();
+		let (spent, unspent) = (outpoint(0x42, 1), outpoint(0x42, 2));
+		for input in [spent, unspent] {
+			check_and_record_seen_input(&store, input, PaymentId([1; 32]), 100).await.unwrap();
+		}
+
+		forget_seen_inputs(&store, [spent]).await.unwrap();
+		assert_eq!(store.get(&spent).await.unwrap(), None);
+		// Another session may use the forgotten input, but not the one still remembered.
+		assert!(!check_and_record_seen_input(&store, spent, PaymentId([2; 32]), 200)
+			.await
+			.unwrap());
+		assert!(check_and_record_seen_input(&store, unspent, PaymentId([2; 32]), 200)
+			.await
+			.unwrap());
+	}
+
+	#[tokio::test]
+	async fn only_inputs_past_retention_are_pruned() {
+		let store = new_store();
+		let (old, recent) = (outpoint(0x42, 1), outpoint(0x42, 2));
+		check_and_record_seen_input(&store, old, PaymentId([1; 32]), 100).await.unwrap();
+		check_and_record_seen_input(&store, recent, PaymentId([1; 32]), 150).await.unwrap();
+
+		// Exactly at the retention age isn't past it yet.
+		assert_eq!(prune_seen_inputs(&store, 200, 100).await.unwrap(), 0);
+
+		assert_eq!(prune_seen_inputs(&store, 201, 100).await.unwrap(), 1);
+		assert_eq!(store.get(&old).await.unwrap(), None);
+		assert!(store.get(&recent).await.unwrap().is_some());
 	}
 }

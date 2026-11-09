@@ -231,6 +231,10 @@ pub(crate) const PAYJOIN_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 // The duration after which completed or failed payjoin sessions are cleaned up (24 hours).
 pub(crate) const PAYJOIN_SESSION_CLEANUP_AGE_SECS: u64 = 24 * 60 * 60;
 
+// How long we remember a payjoin sender's input whose spend we never saw buried (30 days). Until
+// then, a sender reusing it to probe our UTXOs is declined.
+pub(crate) const PAYJOIN_SEEN_INPUT_RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
+
 // How long we keep rebroadcasting a payjoin fallback transaction that neither confirms nor is seen
 // double-spent (1 week). The sender may have double-spent it to someone else, which the wallet
 // never sees.
