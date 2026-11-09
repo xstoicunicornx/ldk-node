@@ -33,7 +33,7 @@ pub use forwarding::{
 #[cfg(feature = "unified-payments")]
 pub(crate) use hrn::HRNResolver;
 pub use onchain::OnchainPayment;
-pub use payjoin::PayjoinPayment;
+pub use payjoin::{PayjoinPayment, PayjoinReceiveSession};
 pub(crate) use pending_payment_store::{FundingTxCandidate, PendingPaymentDetails};
 pub use spontaneous::SpontaneousPayment;
 pub use store::{

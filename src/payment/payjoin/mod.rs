@@ -14,10 +14,9 @@ pub(crate) mod seen_inputs;
 
 use std::sync::{Arc, RwLock};
 
-use crate::{
-	error::Error,
-	payment::payjoin::manager::{PayjoinManager, PayjoinReceiveSession},
-};
+pub use manager::PayjoinReceiveSession;
+
+use crate::{error::Error, payment::payjoin::manager::PayjoinManager};
 
 #[cfg(not(feature = "uniffi"))]
 type FeeRate = bitcoin::FeeRate;
