@@ -117,7 +117,6 @@ impl PayjoinManager {
 		let fee_rate =
 			fee_rate.unwrap_or_else(|| self.fee_estimator.estimate_fee_rate(confirmation_target));
 
-		let address = self.wallet.get_new_address().await?;
 		let ohttp_keys = {
 			let mut result = Err(Error::ConnectionFailed);
 			for relay in self.relay_order(payjoin_config)? {
@@ -141,6 +140,9 @@ impl PayjoinManager {
 		log_debug!(self.logger, "Fetched OHTTP keys: {:?}", ohttp_keys);
 
 		let amount = Amount::from_sat(amount_sats);
+
+		// Revealed only once the OHTTP keys are in hand, so a failed fetch doesn't use up an address.
+		let address = self.wallet.get_new_address().await?;
 
 		// Create a new persister for this session
 		let persister = KVStorePayjoinReceiverPersister::new(
