@@ -225,12 +225,7 @@ impl PayjoinManager {
 					self.send_payjoin_proposal(proposal, persister).await?
 				},
 				ReceiveSession::HasReplyableError(error) => {
-					match self.handle_error(error, persister).await? {
-						// Retry on the next tick instead of hammering the relay
-						// when a transient failure occurs.
-						ReceiveSession::HasReplyableError(_) => return Ok(()),
-						next => next,
-					}
+					self.handle_error(error, persister).await?
 				},
 				ReceiveSession::Monitor(_) => {
 					// `settle_session` closes the session once wallet sync sees a transaction
@@ -678,12 +673,14 @@ impl PayjoinManager {
 				Ok(ReceiveSession::Monitor(session))
 			},
 			Err(e) if e.is_transient() => {
-				log_debug!(
+				// The directory failed the post, e.g. with a 5xx. Nothing was persisted, so like a
+				// failed relay this backs the session off and the proposal is posted again on a
+				// later resume, rather than at once.
+				log_warn!(
 					self.logger,
-					"Transient error sending payjoin proposal, retrying: {e:?}"
+					"Transient error sending payjoin proposal, retrying after backoff: {e:?}"
 				);
-				let proposal = e.transient_state().expect("transient error carries current state");
-				Ok(ReceiveSession::PayjoinProposal(proposal))
+				Err(Error::ConnectionFailed)
 			},
 			Err(e) => {
 				log_error!(
@@ -756,9 +753,13 @@ impl PayjoinManager {
 			},
 			Ok(None) => Ok(ReceiveSession::Closed(ReceiverSessionOutcome::Aborted)),
 			Err(e) if e.is_transient() => {
-				log_debug!(self.logger, "Transient error posting error response, retrying: {e:?}");
-				let session = e.transient_state().expect("transient error carries current state");
-				Ok(ReceiveSession::HasReplyableError(session))
+				// As with the proposal, nothing was persisted, so this backs the session off like a
+				// failed relay and the error reply is posted again on a later resume.
+				log_warn!(
+					self.logger,
+					"Transient error posting error response, retrying after backoff: {e:?}"
+				);
+				Err(Error::ConnectionFailed)
 			},
 			Err(e) => {
 				if let Some(api_err) = e.api_error_ref() {
