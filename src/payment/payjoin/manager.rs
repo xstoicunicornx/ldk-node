@@ -6,6 +6,7 @@
 // accordance with one or both of these licenses.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -16,7 +17,7 @@ use lightning::ln::channelmanager::PaymentId;
 use lightning::log_warn;
 
 use payjoin::io::fetch_ohttp_keys;
-use payjoin::persist::OptionalTransitionOutcome;
+use payjoin::persist::{OptionalTransitionOutcome, PersistedError};
 use payjoin::receive::v2::{
 	replay_event_log_async as replay_receiver_event_log_async, CreateRequestError,
 	HasReplyableError, Initialized, MaybeInputsOwned, MaybeInputsSeen, OutputsUnknown,
@@ -722,14 +723,12 @@ impl PayjoinManager {
 				let session = e.transient_state().expect("transient error carries current state");
 				Ok(ReceiveSession::Initialized(session))
 			},
-			Err(e) => {
-				log_error!(
-					self.logger,
-					"Failed to process the sender's directory response: {:?}",
-					e
-				);
-				Err(Error::PersistenceFailed)
+			// The directory's response was fatal, so payjoin closed the session's log.
+			Err(e) if e.is_fatal() => {
+				log_error!(self.logger, "Payjoin directory rejected the session: {:?}", e);
+				Ok(ReceiveSession::Closed(ReceiverSessionOutcome::Aborted))
 			},
+			Err(e) => Err(self.step_error("process the sender's directory response", &e)),
 		}
 	}
 
@@ -758,6 +757,39 @@ impl PayjoinManager {
 		Ok(response)
 	}
 
+	/// Handles a validation step whose transition failed. A rejection of the sender's proposal
+	/// was saved as [`ReceiveSession::HasReplyableError`], so the session goes on from there to
+	/// tell the sender. Any other failure is returned as [`Self::step_error`] maps it.
+	fn validation_failed<ApiErr: std::error::Error, CurrentState: fmt::Debug>(
+		&self, step: &str,
+		e: PersistedError<ApiErr, Error, Receiver<HasReplyableError>, CurrentState>,
+	) -> Result<ReceiveSession, Error> {
+		if e.storage_error_ref().is_some() || !e.is_fatal() {
+			return Err(self.step_error(step, &e));
+		}
+		if let Some(api_error) = e.api_error_ref() {
+			log_info!(
+				self.logger,
+				"Rejected the sender's proposal. Failed to {}: {}",
+				step,
+				api_error
+			);
+		}
+		e.fatal_state().map(ReceiveSession::HasReplyableError).ok_or(Error::PayjoinSessionFailed)
+	}
+
+	/// The error to return for a step whose transition failed: the persister's error if saving
+	/// it failed, or [`Error::PayjoinSessionFailed`] if payjoin rejected it.
+	fn step_error<ApiErr: std::error::Error, ErrorState: fmt::Debug, CurrentState: fmt::Debug>(
+		&self, step: &str, e: &PersistedError<ApiErr, Error, ErrorState, CurrentState>,
+	) -> Error {
+		log_error!(self.logger, "Failed to {}: {:?}", step, e);
+		match e.storage_error_ref() {
+			Some(storage_error) => *storage_error,
+			None => Error::PayjoinSessionFailed,
+		}
+	}
+
 	async fn check_original_payload(
 		&self, proposal: Receiver<UncheckedOriginalPayload>,
 		persister: &KVStorePayjoinReceiverPersister,
@@ -773,18 +805,19 @@ impl PayjoinManager {
 				Error::PayjoinSessionFailed
 			})?;
 
-		let proposal = proposal
+		let proposal = match proposal
 			.apply_broadcast_suitability(None, is_broadcast_suitable)
 			.save_async(persister)
 			.await
-			.map_err(|e| {
-				log_error!(
-					self.logger,
-					"Failed to check the sender's original transaction for broadcast suitability: {:?}",
-					e
-				);
-				Error::PersistenceFailed
-			})?;
+		{
+			Ok(proposal) => proposal,
+			Err(e) => {
+				return self.validation_failed(
+					"check the sender's original transaction for broadcast suitability",
+					e,
+				)
+			},
+		};
 
 		// The sender's original transaction is the fallback, which the session keeps: if the
 		// payjoin fails or times out, it's broadcast to ensure the receiver still gets paid.
@@ -808,18 +841,16 @@ impl PayjoinManager {
 			marked_checklist.push(item.mark(owned));
 		}
 
-		let proposal = proposal
+		let proposal = match proposal
 			.apply_inputs_owned_checklist(marked_checklist)
 			.save_async(persister)
 			.await
-			.map_err(|e| {
-				log_error!(
-					self.logger,
-					"Failed to check whether the sender's inputs belong to us: {:?}",
-					e
-				);
-				Error::PersistenceFailed
-			})?;
+		{
+			Ok(proposal) => proposal,
+			Err(e) => {
+				return self.validation_failed("check whether the sender's inputs belong to us", e)
+			},
+		};
 
 		Ok(ReceiveSession::MaybeInputsSeen(proposal))
 	}
@@ -847,10 +878,10 @@ impl PayjoinManager {
 		}
 
 		let transition = proposal.apply_inputs_seen_checklist(marked_checklist);
-		let proposal = transition.save_async(persister).await.map_err(|e| {
-			log_error!(self.logger, "Failed to check the sender's inputs for reuse: {:?}", e);
-			Error::PersistenceFailed
-		})?;
+		let proposal = match transition.save_async(persister).await {
+			Ok(proposal) => proposal,
+			Err(e) => return self.validation_failed("check the sender's inputs for reuse", e),
+		};
 
 		Ok(ReceiveSession::OutputsUnknown(proposal))
 	}
@@ -867,18 +898,16 @@ impl PayjoinManager {
 			marked_checklist.push(item.mark(owned));
 		}
 
-		let proposal = proposal
+		let proposal = match proposal
 			.apply_outputs_owned_checklist(marked_checklist)
 			.save_async(persister)
 			.await
-			.map_err(|e| {
-				log_error!(
-					self.logger,
-					"Failed to identify our outputs in the sender's proposal: {:?}",
-					e
-				);
-				Error::PersistenceFailed
-			})?;
+		{
+			Ok(proposal) => proposal,
+			Err(e) => {
+				return self.validation_failed("identify our outputs in the sender's proposal", e)
+			},
+		};
 		Ok(ReceiveSession::WantsOutputs(proposal))
 	}
 
@@ -948,11 +977,11 @@ impl PayjoinManager {
 	async fn apply_fee_range(
 		&self, proposal: Receiver<WantsFeeRange>, persister: &KVStorePayjoinReceiverPersister,
 	) -> Result<ReceiveSession, Error> {
-		let proposal =
-			proposal.apply_fee_range(None, None).save_async(persister).await.map_err(|e| {
-				log_error!(self.logger, "Failed to apply the payjoin fee range: {:?}", e);
-				Error::PersistenceFailed
-			})?;
+		let proposal = proposal
+			.apply_fee_range(None, None)
+			.save_async(persister)
+			.await
+			.map_err(|e| self.step_error("apply the payjoin fee range", &e))?;
 
 		Ok(ReceiveSession::ProvisionalProposal(proposal))
 	}
@@ -962,13 +991,11 @@ impl PayjoinManager {
 	) -> Result<ReceiveSession, Error> {
 		let signed_psbt = self.wallet.process_psbt(proposal.psbt_to_sign())?;
 
-		let proposal =
-			proposal.finalize_signed_proposal(&signed_psbt).save_async(persister).await.map_err(
-				|e| {
-					log_error!(self.logger, "Failed to finalize the payjoin proposal: {:?}", e);
-					Error::PersistenceFailed
-				},
-			)?;
+		let proposal = proposal
+			.finalize_signed_proposal(&signed_psbt)
+			.save_async(persister)
+			.await
+			.map_err(|e| self.step_error("finalize the payjoin proposal", &e))?;
 		Ok(ReceiveSession::PayjoinProposal(proposal))
 	}
 
@@ -1011,14 +1038,15 @@ impl PayjoinManager {
 				);
 				Err(Error::ConnectionFailed)
 			},
-			Err(e) => {
-				log_error!(
-					self.logger,
-					"Failed to process the sender's response to our payjoin proposal: {:?}",
-					e
-				);
-				Err(Error::PersistenceFailed)
+			// The directory's response was fatal, so payjoin saved the session as pending its
+			// fallback, which goes out now.
+			Err(e) if e.is_fatal() => {
+				log_error!(self.logger, "Payjoin directory rejected our proposal: {:?}", e);
+				e.fatal_state()
+					.map(ReceiveSession::PendingFallback)
+					.ok_or(Error::PayjoinSessionFailed)
 			},
+			Err(e) => Err(self.step_error("process the directory's response to our proposal", &e)),
 		}
 	}
 
@@ -1942,8 +1970,9 @@ mod tests {
 			panic!("expected a session that got the sender's original");
 		};
 
-		// The rejection is saved, so the next resume replies to the sender with it.
-		assert!(h.manager.check_inputs_not_owned(proposal, &session.persister).await.is_err());
+		// The rejection is saved, and the session goes on to reply to the sender with it.
+		let next = h.manager.check_inputs_not_owned(proposal, &session.persister).await.unwrap();
+		assert!(matches!(next, ReceiveSession::HasReplyableError(_)));
 		assert!(matches!(replay(&session.persister).await, ReceiveSession::HasReplyableError(_)));
 	}
 
