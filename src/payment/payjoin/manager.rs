@@ -20,9 +20,9 @@ use payjoin::persist::OptionalTransitionOutcome;
 use payjoin::receive::v2::{
 	replay_event_log_async as replay_receiver_event_log_async, CreateRequestError,
 	HasReplyableError, Initialized, MaybeInputsOwned, MaybeInputsSeen, OutputsUnknown,
-	PayjoinProposal, ProvisionalProposal, ReceiveSession, Receiver, ReceiverBuilder, ResolvedBy,
-	SessionOutcome as ReceiverSessionOutcome, UncheckedOriginalPayload, WantsFeeRange, WantsInputs,
-	WantsOutputs,
+	PayjoinProposal, ProvisionalProposal, ReceiveSession, Receiver, ReceiverBuilder, Resolution,
+	ResolvedBy, SessionOutcome as ReceiverSessionOutcome, UncheckedOriginalPayload, WantsFeeRange,
+	WantsInputs, WantsOutputs,
 };
 use payjoin::receive::InputPair;
 use payjoin::ImplementationError;
@@ -35,7 +35,9 @@ use crate::config::{
 };
 use crate::fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
-use crate::payment::payjoin::payjoin_session::{PayjoinSession, PayjoinSessionKind, PayjoinStatus};
+use crate::payment::payjoin::payjoin_session::{
+	PayjoinSessionKind, PayjoinStatus, SessionSpend, SpendKind,
+};
 use crate::payment::payjoin::persist::KVStorePayjoinReceiverPersister;
 use crate::payment::payjoin::seen_inputs::{
 	check_and_record_seen_input, forget_seen_inputs, prune_seen_inputs,
@@ -44,7 +46,7 @@ use crate::payment::payjoin::PayjoinSessionStatus;
 use crate::payment::store::TransactionType;
 
 use crate::types::{Broadcaster, PayjoinSeenInputsStore, PayjoinSessionStore};
-use crate::wallet::{PayjoinFallbackStatus, Wallet};
+use crate::wallet::Wallet;
 use crate::Error;
 
 /// The result of opening a Payjoin receive session.
@@ -183,11 +185,8 @@ impl PayjoinManager {
 	}
 
 	async fn process_receiver_session(
-		&self, session: ReceiveSession, persister: &KVStorePayjoinReceiverPersister,
+		&self, mut session: ReceiveSession, persister: &KVStorePayjoinReceiverPersister,
 	) -> Result<(), Error> {
-		let Some(mut session) = self.settle_session(session, persister).await? else {
-			return Ok(());
-		};
 		if persister.get_session().await?.cancel_requested {
 			let Some(next) = self.apply_cancel(session, persister).await? else {
 				return Ok(());
@@ -235,8 +234,8 @@ impl PayjoinManager {
 					self.handle_error(error, persister).await?
 				},
 				ReceiveSession::Monitor(_) => {
-					// `settle_session` closes the session once wallet sync sees a transaction
-					// spending the sender's inputs, so there is nothing to do until then.
+					// Wallet sync settles the session once it sees a transaction spending the
+					// sender's inputs buried, so there is nothing to do until then.
 					log_debug!(
 						self.logger,
 						"Payjoin session {} is waiting for the sender to broadcast.",
@@ -246,8 +245,7 @@ impl PayjoinManager {
 				},
 				ReceiveSession::PendingFallback(pending) => {
 					let fallback_tx = pending.fallback_tx().clone();
-					let mut payjoin_session = persister.get_session().await?;
-					self.close_session_with_fallback(&mut payjoin_session, Some(&fallback_tx))
+					self.close_session_with_fallback(persister.session_id(), Some(fallback_tx))
 						.await;
 
 					pending.close().save_async(persister).await?;
@@ -262,8 +260,8 @@ impl PayjoinManager {
 
 	/// Applies a cancellation requested through [`Self::cancel_session`].
 	///
-	/// Runs after [`Self::settle_session`], so only for a session nothing spends the sender's
-	/// inputs of yet. Returns the session to keep processing: [`ReceiveSession::PendingFallback`]
+	/// Only runs for a session that wallet sync saw no spend of the sender's inputs for, since
+	/// such a session isn't resumed. Returns the session to keep processing: [`ReceiveSession::PendingFallback`]
 	/// if the session had the sender's fallback, so it is broadcast like that of a failed payjoin,
 	/// or the session unchanged if it is ending already. Returns `None` if the session closed.
 	async fn apply_cancel(
@@ -333,7 +331,16 @@ impl PayjoinManager {
 		let Some(session) = self.payjoin_session_store.get(&session_id).await? else {
 			return Ok(None);
 		};
-		Ok(Some(session.user_status()))
+		// Only these report the fallback, which takes replaying the session.
+		let reports_fallback = session.status == PayjoinStatus::FallbackPending
+			|| (session.status == PayjoinStatus::Failed && session.cancel_requested);
+		let fallback_txid = match self.persister(session_id).await {
+			Some(persister) if reports_fallback => {
+				self.session_fallback(&persister).await.map(|tx| tx.compute_txid())
+			},
+			_ => None,
+		};
+		Ok(Some(session.user_status(fallback_txid)))
 	}
 
 	/// Requests the cancellation of the session `session_id`, which the resume task applies.
@@ -347,16 +354,10 @@ impl PayjoinManager {
 		if session.cancel_requested {
 			return Ok(());
 		}
-		if session.status != PayjoinStatus::Active {
+		// Once wallet sync saw something spend the sender's inputs, the session settles on that,
+		// so cancelling would change nothing.
+		if session.status != PayjoinStatus::Active || session.spend.is_some() {
 			return Err(Error::PayjoinSessionNotCancellable);
-		}
-		// Once something spends the sender's inputs, the session settles on that, so cancelling
-		// would change nothing.
-		if let Some(fallback_tx) = session.fallback_tx() {
-			let inputs = fallback_tx.input.iter().map(|txin| txin.previous_output);
-			if !self.wallet.spends_of_outpoints(inputs).is_empty() {
-				return Err(Error::PayjoinSessionNotCancellable);
-			}
 		}
 
 		// Set atomically, so a session ending meanwhile isn't flagged.
@@ -368,7 +369,7 @@ impl PayjoinManager {
 					outcome = Ok(());
 					return None;
 				}
-				if existing.status != PayjoinStatus::Active {
+				if existing.status != PayjoinStatus::Active || existing.spend.is_some() {
 					outcome = Err(Error::PayjoinSessionNotCancellable);
 					return None;
 				}
@@ -386,60 +387,174 @@ impl PayjoinManager {
 		Ok(())
 	}
 
-	/// Settles a session against the transactions wallet sync has seen spending the sender's
-	/// inputs.
+	/// Reports transactions wallet sync saw, new or newly confirmed, to the active sessions.
 	///
-	/// [`ReceiveSession::classify_tx`] tells whether such a spend is the payjoin, the sender's
-	/// fallback, or neither. A payjoin is tagged as such on the payment as soon as it is seen. The
-	/// session closes once the spend is confirmed through [`ANTI_REORG_DELAY`], and until then the
-	/// protocol isn't advanced any further, as a proposal could no longer confirm.
+	/// Each is classified against each session. One spending the sender's inputs is recorded as
+	/// the session's [`spend`], which pauses the session, and a payjoin is tagged as such on its
+	/// payment. The session settles once that spend is buried, which [`Self::on_tx_buried`]
+	/// reports.
 	///
-	/// Returns the session if nothing spends the sender's inputs yet, so the protocol should
-	/// continue, or `None` if something does.
-	async fn settle_session(
-		&self, session: ReceiveSession, persister: &KVStorePayjoinReceiverPersister,
-	) -> Result<Option<ReceiveSession>, Error> {
-		// Recorded once the sender's original transaction passed the broadcast suitability check,
-		// which is the first state `classify_tx` supports.
-		let Some(fallback_tx) = persister.get_session().await?.fallback_tx().cloned() else {
-			return Ok(Some(session));
-		};
+	/// [`spend`]: crate::payment::payjoin::payjoin_session::PayjoinSession::spend
+	pub(crate) async fn on_txs_seen(&self, txs: &[Arc<Transaction>]) -> Result<(), Error> {
+		if txs.is_empty() {
+			return Ok(());
+		}
+		let sessions =
+			self.payjoin_session_store.list_filter(|s| s.status == PayjoinStatus::Active).await;
+		for session in sessions {
+			let session_id = session.session_id;
+			let Some(persister) = self.persister(session_id).await else {
+				continue;
+			};
+			// An expired or unreadable session is closed by the resume task, not settled here.
+			let Replayed::Open(state, _) = self.replay(&persister).await else {
+				continue;
+			};
+			for tx in txs {
+				let Some(resolution) = state.classify_tx(tx) else {
+					continue;
+				};
+				let txid = tx.compute_txid();
+				let kind = spend_kind(resolution.resolved_by());
+				if kind == SpendKind::Payjoin {
+					self.wallet.classify_payjoin(txid, Some(tx)).await?;
+				}
+				let recorded =
+					self.payjoin_session_store
+						.mutate(&session_id, |existing| {
+							let existing = existing?;
+							let spend = Some(SessionSpend { txid, kind });
+							(existing.status == PayjoinStatus::Active && existing.spend != spend)
+								.then(|| {
+									let mut session = existing.clone();
+									session.spend = spend;
+									session
+								})
+						})
+						.await?;
+				if recorded.is_none() {
+					continue;
+				}
+				log_info!(
+					self.logger,
+					"Payjoin session {} saw {:?} transaction {} spend the sender's inputs. It settles once that's buried.",
+					session_id,
+					kind,
+					txid
+				);
+			}
+		}
+		Ok(())
+	}
 
-		let spends = self
-			.wallet
-			.spends_of_outpoints(fallback_tx.input.iter().map(|txin| txin.previous_output));
-		// Spends come most confirmed first, which is the one `classify_tx` asks to classify.
-		let Some((tx, confirmations, resolution)) = spends.into_iter().find_map(|(tx, confs)| {
-			session.classify_tx(&tx).map(|resolution| (tx, confs, resolution))
-		}) else {
-			return Ok(Some(session));
-		};
+	/// Reports transactions wallet sync saw dropped or replaced, which unpauses the sessions that
+	/// were waiting on them to be buried.
+	pub(crate) async fn on_txs_gone(&self, txids: &[Txid]) -> Result<(), Error> {
+		if txids.is_empty() {
+			return Ok(());
+		}
+		let waiting = self
+			.payjoin_session_store
+			.list_filter(|s| s.spend.as_ref().is_some_and(|spend| txids.contains(&spend.txid)))
+			.await;
+		for session in waiting {
+			self.payjoin_session_store
+				.mutate(&session.session_id, |existing| {
+					let existing = existing?;
+					existing.spend.as_ref().is_some_and(|spend| txids.contains(&spend.txid)).then(
+						|| {
+							let mut session = existing.clone();
+							session.spend = None;
+							session
+						},
+					)
+				})
+				.await?;
+			log_info!(
+				self.logger,
+				"The transaction payjoin session {} was waiting on is gone. Resuming the session.",
+				session.session_id
+			);
+		}
+		Ok(())
+	}
 
-		let session_id = persister.session_id();
-		let txid = tx.compute_txid();
-		let resolved_by = resolution.resolved_by();
-		if resolved_by == ResolvedBy::Payjoin {
-			self.wallet.classify_payjoin(txid, Some(&tx)).await?;
+	/// Reports a transaction wallet sync saw confirmed through [`ANTI_REORG_DELAY`], which settles
+	/// the sessions whose sender inputs it spends.
+	///
+	/// An active session classifies it, and its log is closed with the result. A session that
+	/// can't classify it, because its log is closed already pending the fallback, or it expired,
+	/// settles on the fallback's inputs being spent instead.
+	pub(crate) async fn on_tx_buried(&self, txid: Txid) -> Result<(), Error> {
+		let sessions = self
+			.payjoin_session_store
+			.list_filter(|s| {
+				s.status == PayjoinStatus::Active || s.status == PayjoinStatus::FallbackPending
+			})
+			.await;
+		if sessions.is_empty() {
+			return Ok(());
+		}
+		// Checked here rather than taken from the caller, which reports it from a snapshot.
+		let Some((tx, confirmations)) = self.wallet.tx_with_confirmations(txid) else {
+			return Ok(());
+		};
+		if confirmations < ANTI_REORG_DELAY {
+			return Ok(());
 		}
 
-		if confirmations < ANTI_REORG_DELAY {
-			log_debug!(
-				self.logger,
-				"Payjoin session {} was resolved by {:?} transaction {} with {} confirmations. Closing it at {}.",
-				session_id,
-				resolved_by,
-				txid,
-				confirmations,
-				ANTI_REORG_DELAY
-			);
-			return Ok(None);
+		for session in sessions {
+			let Some(persister) = self.persister(session.session_id).await else {
+				continue;
+			};
+			match self.replay(&persister).await {
+				Replayed::Open(state, fallback) if session.status == PayjoinStatus::Active => {
+					match state.classify_tx(&tx) {
+						Some(resolution) => {
+							self.settle_session(&persister, state, fallback, &tx, resolution)
+								.await?
+						},
+						// The session can't classify in its current state, e.g. pending the
+						// fallback because the resume task hasn't broadcast it yet.
+						None => {
+							if let Some(fallback) = fallback {
+								self.settle_on_fallback_inputs(session.session_id, &tx, &fallback)
+									.await?
+							}
+						},
+					}
+				},
+				Replayed::Open(_, Some(fallback)) | Replayed::Expired(Some(fallback)) => {
+					self.settle_on_fallback_inputs(session.session_id, &tx, &fallback).await?
+				},
+				_ => {},
+			}
+		}
+		Ok(())
+	}
+
+	/// Settles an active session on `tx`, which spends the sender's inputs and is confirmed
+	/// through [`ANTI_REORG_DELAY`], as classified against the session.
+	async fn settle_session(
+		&self, persister: &KVStorePayjoinReceiverPersister, state: ReceiveSession,
+		fallback: Option<Transaction>, tx: &Transaction, resolution: Resolution,
+	) -> Result<(), Error> {
+		let session_id = persister.session_id();
+		let txid = tx.compute_txid();
+		let kind = spend_kind(resolution.resolved_by());
+		// Wallet sync records a replacement in the record of what it replaced, so the record
+		// holding `tx` may carry the tag of a payjoin it replaced.
+		if kind == SpendKind::Payjoin {
+			self.wallet.classify_payjoin(txid, Some(tx)).await?;
+		} else {
+			self.wallet.untag_payjoin(txid).await?;
 		}
 
 		// A spend that lost to this one can no longer confirm, but wallet sync leaves its payment
-		// pending. For example, the payjoin after a reorg let the fallback win. Done before the
-		// session is marked settled, so a failure is retried on the next tick.
-		for lost in self.wallet.lost_conflicts_of(&tx) {
-			let Some(lost_resolution) = session.classify_tx(&lost) else {
+		// pending if it dropped the loser before seeing the winner, rather than recording the
+		// winner as its replacement.
+		for lost in self.wallet.lost_conflicts_of(tx) {
+			let Some(lost_resolution) = state.classify_tx(&lost) else {
 				// Lost on one of our own inputs, not the sender's.
 				continue;
 			};
@@ -447,47 +562,29 @@ impl PayjoinManager {
 				.then_some(TransactionType::Payjoin);
 			self.wallet.fail_payment_lost_to_conflict(lost.compute_txid(), tx_type).await?;
 		}
-		self.forget_spent_sender_inputs(&tx, &fallback_tx).await;
+		if let Some(fallback) = &fallback {
+			self.forget_spent_sender_inputs(tx, fallback).await;
+		}
 
+		let status = match kind {
+			SpendKind::Payjoin => PayjoinStatus::Completed,
+			SpendKind::Fallback | SpendKind::Unrecognized => PayjoinStatus::Failed,
+		};
 		// Our record goes first: resumption only picks up active sessions, so if persisting the
 		// close event fails afterwards, the session is still never replayed.
-		let mut payjoin_session = persister.get_session().await?;
-		payjoin_session.status = match resolved_by {
-			ResolvedBy::Payjoin => {
-				log_info!(
-					self.logger,
-					"Payjoin session {} completed: payjoin transaction {} confirmed.",
-					session_id,
-					txid
-				);
-				PayjoinStatus::Completed
-			},
-			ResolvedBy::Fallback => {
-				log_info!(
-					self.logger,
-					"Payjoin session {} failed: the sender's fallback transaction {} confirmed.",
-					session_id,
-					txid
-				);
-				PayjoinStatus::Failed
-			},
-			_ => {
-				log_warn!(
-					self.logger,
-					"Payjoin session {} failed: the sender's inputs were spent by unrecognized transaction {}.",
-					session_id,
-					txid
-				);
-				PayjoinStatus::Failed
-			},
-		};
-		payjoin_session.resolution_txid = Some(txid);
-		payjoin_session.completed_at.get_or_insert_with(|| {
-			SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0)).as_secs()
-		});
-		self.payjoin_session_store.insert_or_update(payjoin_session).await?;
+		if !self.settle_record(session_id, &[PayjoinStatus::Active], status, Some(txid)).await? {
+			return Ok(());
+		}
+		log_info!(
+			self.logger,
+			"Payjoin session {} settled as {:?}: {:?} transaction {} is buried.",
+			session_id,
+			status,
+			kind,
+			txid
+		);
 
-		if let Err(e) = session.close(resolution).save_async(persister).await {
+		if let Err(e) = state.close(resolution).save_async(persister).await {
 			log_error!(
 				self.logger,
 				"Failed to record the close of payjoin session {}: {:?}",
@@ -495,7 +592,104 @@ impl PayjoinManager {
 				e
 			);
 		}
-		Ok(None)
+		Ok(())
+	}
+
+	/// Settles a session that can't classify `tx`, which is confirmed through
+	/// [`ANTI_REORG_DELAY`], on whether it spends the inputs of the session's `fallback`.
+	async fn settle_on_fallback_inputs(
+		&self, session_id: PaymentId, tx: &Transaction, fallback: &Transaction,
+	) -> Result<(), Error> {
+		if !spends_any_input_of(tx, fallback) {
+			return Ok(());
+		}
+		let txid = tx.compute_txid();
+		// Only the fallback can be told apart from the payjoin without classifying.
+		if txid == fallback.compute_txid() {
+			self.wallet.untag_payjoin(txid).await?;
+		}
+		self.fail_lost_spends(tx, fallback).await?;
+		self.forget_spent_sender_inputs(tx, fallback).await;
+		let settled = self
+			.settle_record(
+				session_id,
+				&[PayjoinStatus::Active, PayjoinStatus::FallbackPending],
+				PayjoinStatus::Failed,
+				Some(txid),
+			)
+			.await?;
+		if settled {
+			log_info!(
+				self.logger,
+				"Payjoin session {} failed: transaction {} spending the sender's inputs is buried.",
+				session_id,
+				txid
+			);
+		}
+		Ok(())
+	}
+
+	/// Moves session `session_id` to the terminal `status`, recording `resolution_txid` as what
+	/// settled it, if it's still in one of `from`. Returns whether it was.
+	async fn settle_record(
+		&self, session_id: PaymentId, from: &[PayjoinStatus], status: PayjoinStatus,
+		resolution_txid: Option<Txid>,
+	) -> Result<bool, Error> {
+		let now = unix_now();
+		let mut settled = false;
+		self.payjoin_session_store
+			.mutate(&session_id, |existing| {
+				let existing = existing?;
+				if !from.contains(&existing.status) {
+					return None;
+				}
+				settled = true;
+				let mut session = existing.clone();
+				session.status = status;
+				session.resolution_txid = resolution_txid;
+				session.completed_at.get_or_insert(now);
+				Some(session)
+			})
+			.await?;
+		Ok(settled)
+	}
+
+	async fn persister(&self, session_id: PaymentId) -> Option<KVStorePayjoinReceiverPersister> {
+		KVStorePayjoinReceiverPersister::from_session(
+			session_id,
+			Arc::clone(&self.payjoin_session_store),
+		)
+		.await
+		.ok()
+	}
+
+	/// Replays a session's event log, along with the session's fallback transaction, if it
+	/// received the sender's original.
+	async fn replay(&self, persister: &KVStorePayjoinReceiverPersister) -> Replayed {
+		match replay_receiver_event_log_async(persister).await {
+			Ok((state, history)) => Replayed::Open(state, history.fallback_tx()),
+			Err(e) if e.is_expired() => Replayed::Expired(e.expiry_fallback_tx().cloned()),
+			Err(e) => {
+				log_error!(
+					self.logger,
+					"Failed to replay payjoin session {}: {:?}",
+					persister.session_id(),
+					e
+				);
+				Replayed::Unreadable
+			},
+		}
+	}
+
+	/// The fallback transaction of the session `persister` is for, if it received the sender's
+	/// original and its log can be replayed.
+	async fn session_fallback(
+		&self, persister: &KVStorePayjoinReceiverPersister,
+	) -> Option<Transaction> {
+		match self.replay(persister).await {
+			Replayed::Open(_, fallback) | Replayed::Expired(fallback) => fallback,
+			Replayed::Unreadable => None,
+		}
 	}
 
 	async fn read_from_directory(
@@ -593,14 +787,8 @@ impl PayjoinManager {
 				Error::PersistenceFailed
 			})?;
 
-		// The sender's original transaction is the fallback: if the payjoin fails or times out,
-		// broadcast it to ensure the receiver still gets paid. Its inputs are also what
-		// `settle_session` looks for spends of.
-		let mut session = persister.get_session().await?;
-
-		session.set_fallback_tx(transaction);
-		self.payjoin_session_store.insert_or_update(session).await?;
-
+		// The sender's original transaction is the fallback, which the session keeps: if the
+		// payjoin fails or times out, it's broadcast to ensure the receiver still gets paid.
 		log_info!(
 			self.logger,
 			"Fallback transaction received. This will be broadcast if the Payjoin fails"
@@ -943,13 +1131,15 @@ impl PayjoinManager {
 			ReceiverSessionOutcome::FallbackBroadcasted => {
 				log_info!(self.logger, "Payjoin failed. Fallback transaction was broadcasted.");
 				session.status = PayjoinStatus::Failed;
-				session.resolution_txid = session.fallback_tx().map(|tx| tx.compute_txid());
+				session.resolution_txid =
+					self.session_fallback(persister).await.map(|tx| tx.compute_txid());
 
 				self.payjoin_session_store.insert_or_update(session).await?;
 			},
 			ReceiverSessionOutcome::Aborted => {
 				log_info!(self.logger, "Payjoin session was aborted.");
-				self.close_session_with_fallback(&mut session, None).await;
+				let fallback_tx = self.session_fallback(persister).await;
+				self.close_session_with_fallback(session_id, fallback_tx).await;
 			},
 			ReceiverSessionOutcome::Unrecognized(txid) => {
 				log_error!(
@@ -981,6 +1171,8 @@ impl PayjoinManager {
 			.list_filter(|p| {
 				matches!(p.kind, PayjoinSessionKind::Receive)
 					&& p.status == PayjoinStatus::Active
+					// Waiting for wallet sync to see its spend buried, so not advanced.
+					&& p.spend.is_none()
 					&& !backing_off.contains(&p.session_id)
 			})
 			.await
@@ -1038,14 +1230,9 @@ impl PayjoinManager {
 						res
 					});
 				},
-				Err(e) if e.is_expired() => match recv_persister.get_session().await {
-					Ok(mut session) => {
-						self.close_session_with_fallback(&mut session, e.expiry_fallback_tx()).await
-					},
-					Err(err) => log_error!(
-						self.logger,
-						"Failed to close expired receiver session {session_id}: {err:?}"
-					),
+				Err(e) if e.is_expired() => {
+					self.close_session_with_fallback(session_id, e.expiry_fallback_tx().cloned())
+						.await
 				},
 				Err(e) => {
 					log_error!(
@@ -1053,26 +1240,8 @@ impl PayjoinManager {
 						"An error {:?} occurred while replaying receiver session",
 						e
 					);
-					match self.payjoin_session_store.get(&session_id).await {
-						Ok(Some(mut session)) => {
-							self.close_session_with_fallback(&mut session, None).await;
-						},
-						Ok(None) => {
-							log_error!(
-								self.logger,
-								"Payjoin session {} disappeared before it could be closed.",
-								session_id
-							);
-						},
-						Err(e) => {
-							log_error!(
-								self.logger,
-								"Failed to read payjoin session {} while closing it: {:?}",
-								session_id,
-								e
-							);
-						},
-					}
+					// The fallback is only in the log, so there's nothing to broadcast.
+					self.close_session_with_fallback(session_id, None).await;
 				},
 			}
 		}
@@ -1097,42 +1266,33 @@ impl PayjoinManager {
 		Ok(())
 	}
 
-	/// Closes a session whose payjoin didn't complete and broadcasts its fallback transaction.
+	/// Closes an active session whose payjoin didn't complete and broadcasts its fallback
+	/// transaction, if it has one.
 	///
 	/// The broadcast queue doesn't survive a restart, so the session is persisted as
-	/// [`PayjoinStatus::FallbackPending`] with its fallback before the fallback is queued, and
-	/// [`Self::rebroadcast_pending_fallbacks`] keeps broadcasting it until it resolves.
+	/// [`PayjoinStatus::FallbackPending`] before the fallback is queued, and
+	/// [`Self::rebroadcast_pending_fallbacks`] keeps broadcasting it until wallet sync sees it, or
+	/// another spend of the sender's inputs, buried. A session no longer active, e.g. because
+	/// wallet sync settled it meanwhile, is left alone.
 	async fn close_session_with_fallback(
-		&self, session: &mut PayjoinSession, fallback_tx: Option<&Transaction>,
+		&self, session_id: PaymentId, fallback_tx: Option<Transaction>,
 	) {
-		// Keep an earlier timestamp if payjoin's `close()` already ran
-		session.completed_at.get_or_insert_with(|| {
-			SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0)).as_secs()
-		});
-
-		let fallback_tx = fallback_tx.cloned().or_else(|| session.fallback_tx().cloned());
-
-		if let Some(fallback_tx) = &fallback_tx {
-			session.set_fallback_tx(fallback_tx.clone());
-			session.status = PayjoinStatus::FallbackPending;
+		let status = if fallback_tx.is_some() {
+			PayjoinStatus::FallbackPending
 		} else {
 			log_warn!(
 				self.logger,
-				"Payjoin session {} missing fallback transaction; closing as Failed without broadcast.",
-				session.session_id
+				"Payjoin session {} has no fallback transaction; closing as Failed without broadcast.",
+				session_id
 			);
-			session.status = PayjoinStatus::Failed;
-		}
-
-		if let Err(close_err) = self.payjoin_session_store.insert_or_update(session.clone()).await {
-			log_error!(
-				self.logger,
-				"Failed to close receiver session {}: {:?}",
-				session.session_id,
-				close_err
-			);
-		} else {
-			log_info!(self.logger, "Closed failed receiver session: {}", session.session_id);
+			PayjoinStatus::Failed
+		};
+		match self.settle_record(session_id, &[PayjoinStatus::Active], status, None).await {
+			Ok(true) => log_info!(self.logger, "Closed failed receiver session: {}", session_id),
+			Ok(false) => return,
+			Err(e) => {
+				log_error!(self.logger, "Failed to close receiver session {}: {:?}", session_id, e)
+			},
 		}
 
 		// Broadcast even if persisting failed: a broadcast that may not be retried beats none.
@@ -1142,8 +1302,8 @@ impl PayjoinManager {
 	}
 
 	/// Rebroadcasts the fallback transaction of every [`PayjoinStatus::FallbackPending`] session
-	/// once per chain tip, and marks a session [`PayjoinStatus::Failed`] once the wallet sees its
-	/// fallback, or a transaction double-spending it, confirmed through `ANTI_REORG_DELAY`.
+	/// once per chain tip, until wallet sync sees it, or another spend of the sender's inputs,
+	/// buried, which [`Self::on_tx_buried`] settles, or until it's given up on.
 	///
 	/// Like the wallet's rebroadcast of its own unconfirmed transactions, this runs on chain tip
 	/// changes, and its first pass after startup rebroadcasts what a restart dropped from the
@@ -1164,17 +1324,17 @@ impl PayjoinManager {
 			.list_filter(|s| s.status == PayjoinStatus::FallbackPending)
 			.await;
 
-		let now = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.unwrap_or(Duration::from_secs(0))
-			.as_secs();
-
+		let now = unix_now();
 		for session in pending_sessions {
 			let session_id = session.session_id;
-			let Some(fallback_tx) = session.fallback_tx() else {
+			let fallback_tx = match self.persister(session_id).await {
+				Some(persister) => self.session_fallback(&persister).await,
+				None => None,
+			};
+			let Some(fallback_tx) = fallback_tx else {
 				log_warn!(
 					self.logger,
-					"Payjoin session {} is pending a fallback it doesn't have; marking it Failed.",
+					"Payjoin session {} is pending a fallback it can't recover; marking it Failed.",
 					session_id
 				);
 				self.resolve_pending_fallback(session_id, None).await;
@@ -1182,91 +1342,45 @@ impl PayjoinManager {
 			};
 			let fallback_txid = fallback_tx.compute_txid();
 
-			match self.wallet.payjoin_fallback_status(fallback_tx) {
-				PayjoinFallbackStatus::Confirmed => {
-					log_info!(
-						self.logger,
-						"Fallback transaction {} of payjoin session {} confirmed.",
-						fallback_txid,
-						session_id
-					);
-					self.forget_spent_sender_inputs(fallback_tx, fallback_tx).await;
-					if self.fail_lost_spends(fallback_tx, fallback_tx).await {
-						self.resolve_pending_fallback(session_id, Some(fallback_txid)).await;
-					}
-				},
-				PayjoinFallbackStatus::Conflicted(winner) => {
-					log_info!(
-						self.logger,
-						"Fallback transaction {} of payjoin session {} was double-spent by {}.",
-						fallback_txid,
-						session_id,
-						winner.compute_txid()
-					);
-					self.forget_spent_sender_inputs(&winner, fallback_tx).await;
-					if self.fail_lost_spends(&winner, fallback_tx).await {
-						self.resolve_pending_fallback(session_id, Some(winner.compute_txid()))
-							.await;
-					}
-				},
-				PayjoinFallbackStatus::Unresolved => {
-					let closed_at = session.completed_at.unwrap_or(session.latest_update_timestamp);
-					if now.saturating_sub(closed_at) > PAYJOIN_FALLBACK_REBROADCAST_TIMEOUT_SECS {
-						log_warn!(
-							self.logger,
-							"Giving up on fallback transaction {} of payjoin session {}: not confirmed after {}s.",
-							fallback_txid,
-							session_id,
-							PAYJOIN_FALLBACK_REBROADCAST_TIMEOUT_SECS
-						);
-						self.resolve_pending_fallback(session_id, None).await;
-					} else {
-						log_debug!(
-							self.logger,
-							"Rebroadcasting fallback transaction {} of payjoin session {}.",
-							fallback_txid,
-							session_id
-						);
-						self.broadcaster.broadcast(fallback_tx.clone());
-					}
-				},
+			let closed_at = session.completed_at.unwrap_or(session.latest_update_timestamp);
+			if now.saturating_sub(closed_at) > PAYJOIN_FALLBACK_REBROADCAST_TIMEOUT_SECS {
+				log_warn!(
+					self.logger,
+					"Giving up on fallback transaction {} of payjoin session {}: not confirmed after {}s.",
+					fallback_txid,
+					session_id,
+					PAYJOIN_FALLBACK_REBROADCAST_TIMEOUT_SECS
+				);
+				self.resolve_pending_fallback(session_id, None).await;
+			} else {
+				log_debug!(
+					self.logger,
+					"Rebroadcasting fallback transaction {} of payjoin session {}.",
+					fallback_txid,
+					session_id
+				);
+				self.broadcaster.broadcast(fallback_tx);
 			}
 		}
 	}
 
-	/// Fails the payments of the spends that lost to `winner`, a spend of a pending fallback's
-	/// inputs confirmed through [`ANTI_REORG_DELAY`], which wallet sync would leave pending: the
-	/// fallback we broadcast when the sender's payjoin won anyway, or the payjoin when the
-	/// fallback won.
+	/// Fails the payments of the spends that lost to `winner`, which spends the inputs of a
+	/// session's `fallback_tx` and is confirmed through [`ANTI_REORG_DELAY`], and which wallet sync
+	/// would leave pending: the fallback we broadcast when the sender's payjoin won anyway, or the
+	/// payjoin when the fallback won.
 	///
-	/// The session is already closed, so the losers can't be classified against it. Only those
-	/// spending one of the sender's inputs, which `fallback_tx` spends, are failed, not ones that
-	/// lost on an input of ours a payjoin spent. A payjoin keeps the tag it got when
-	/// `settle_session` saw it. Returns whether all of them were failed, so the session is only
-	/// resolved once they were and a failure is retried on the next tip.
-	async fn fail_lost_spends(&self, winner: &Transaction, fallback_tx: &Transaction) -> bool {
-		let spends_sender_input = |tx: &Transaction| {
-			tx.input.iter().any(|txin| {
-				fallback_tx
-					.input
-					.iter()
-					.any(|sender| sender.previous_output == txin.previous_output)
-			})
-		};
-		for lost in self.wallet.lost_conflicts_of(winner).into_iter().filter(spends_sender_input) {
-			let lost_txid = lost.compute_txid();
-			if let Err(e) = self.wallet.fail_payment_lost_to_conflict(lost_txid, None).await {
-				log_error!(
-					self.logger,
-					"Failed to fail the payment of transaction {}, which lost to {}: {:?}. Will retry on the next chain tip.",
-					lost_txid,
-					winner.compute_txid(),
-					e
-				);
-				return false;
+	/// Used for a session that can't classify the losers. Only those spending one of the sender's
+	/// inputs, which `fallback_tx` spends, are failed, not ones that lost on an input of ours a
+	/// payjoin spent. A payjoin keeps the tag it got when wallet sync saw it.
+	async fn fail_lost_spends(
+		&self, winner: &Transaction, fallback_tx: &Transaction,
+	) -> Result<(), Error> {
+		for lost in self.wallet.lost_conflicts_of(winner) {
+			if spends_any_input_of(&lost, fallback_tx) {
+				self.wallet.fail_payment_lost_to_conflict(lost.compute_txid(), None).await?;
 			}
 		}
-		true
+		Ok(())
 	}
 
 	/// Forgets the seen sender inputs, which `fallback_tx` spends, that `winner` spends, now that
@@ -1296,15 +1410,12 @@ impl PayjoinManager {
 	/// rebroadcast of its fallback, and records `resolution_txid` as what settled it.
 	async fn resolve_pending_fallback(&self, session_id: PaymentId, resolution_txid: Option<Txid>) {
 		let res = self
-			.payjoin_session_store
-			.mutate(&session_id, |existing| {
-				let mut session = existing?.clone();
-				(session.status == PayjoinStatus::FallbackPending).then(|| {
-					session.status = PayjoinStatus::Failed;
-					session.resolution_txid = resolution_txid;
-					session
-				})
-			})
+			.settle_record(
+				session_id,
+				&[PayjoinStatus::FallbackPending],
+				PayjoinStatus::Failed,
+				resolution_txid,
+			)
 			.await;
 		if let Err(e) = res {
 			log_error!(
@@ -1373,6 +1484,35 @@ impl PayjoinManager {
 	}
 }
 
+/// A session's event log, replayed.
+enum Replayed {
+	/// The session in its current state, with its fallback transaction if it has one.
+	Open(ReceiveSession, Option<Transaction>),
+	/// The session expired, with its fallback transaction if it has one.
+	Expired(Option<Transaction>),
+	/// The log couldn't be replayed.
+	Unreadable,
+}
+
+fn spend_kind(resolved_by: ResolvedBy) -> SpendKind {
+	match resolved_by {
+		ResolvedBy::Payjoin => SpendKind::Payjoin,
+		ResolvedBy::Fallback => SpendKind::Fallback,
+		_ => SpendKind::Unrecognized,
+	}
+}
+
+/// Whether `tx` spends any of the inputs of `fallback_tx`, i.e. any of the sender's.
+fn spends_any_input_of(tx: &Transaction, fallback_tx: &Transaction) -> bool {
+	tx.input.iter().any(|txin| {
+		fallback_tx.input.iter().any(|sender| sender.previous_output == txin.previous_output)
+	})
+}
+
+fn unix_now() -> u64 {
+	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0)).as_secs()
+}
+
 #[cfg(all(test, feature = "chain-esplora"))]
 mod tests {
 	use std::collections::HashMap;
@@ -1396,8 +1536,9 @@ mod tests {
 	use crate::payment::{PaymentDetails, PaymentKind};
 	use crate::types::{DynStore, DynStoreWrapper};
 	use crate::wallet::tests::{
-		insert_confirmed_tx, insert_unconfirmed_tx, new_test_wallet, observe_unconfirmed,
-		recorded_payment, set_chain_tip, tx_spending,
+		chain_tip_changed, insert_confirmed_tx, new_test_wallet, observe_confirmed,
+		observe_dropped, observe_replaced, observe_unconfirmed, recorded_payment, set_chain_tip,
+		tx_spending,
 	};
 	use crate::{NodeMetrics, PersistedNodeMetrics};
 
@@ -1434,7 +1575,7 @@ mod tests {
 	const SENDER_INPUT_SATS: u64 = 200_000;
 
 	struct Harness {
-		manager: PayjoinManager,
+		manager: Arc<PayjoinManager>,
 		wallet: Arc<Wallet>,
 		broadcaster: Arc<Broadcaster>,
 		session_store: Arc<PayjoinSessionStore>,
@@ -1488,7 +1629,7 @@ mod tests {
 			Arc::clone(&store),
 			Arc::clone(&logger),
 		));
-		let manager = PayjoinManager::new(
+		let manager = Arc::new(PayjoinManager::new(
 			Arc::clone(&session_store),
 			seen_inputs_store,
 			logger,
@@ -1497,7 +1638,8 @@ mod tests {
 			fee_estimator,
 			Arc::new(chain_source),
 			Arc::clone(&broadcaster),
-		);
+		));
+		wallet.set_payjoin_manager(Arc::downgrade(&manager));
 		Harness { manager, wallet, broadcaster, session_store }
 	}
 
@@ -1608,8 +1750,7 @@ mod tests {
 	}
 
 	/// A session that received an original spending `sender_inputs` and passed the broadcast
-	/// suitability check, so it's in [`ReceiveSession::MaybeInputsOwned`], with its fallback
-	/// recorded as [`PayjoinManager::check_original_payload`] does.
+	/// suitability check, so it's in [`ReceiveSession::MaybeInputsOwned`].
 	async fn session_with_original(
 		h: &Harness, sender_inputs: &[OutPoint], expiration: u64,
 	) -> TestSession {
@@ -1626,9 +1767,6 @@ mod tests {
 			persister.save_event(event).await.unwrap();
 		}
 		let fallback = original.extract_tx_unchecked_fee_rate();
-		let mut session = persister.get_session().await.unwrap();
-		session.set_fallback_tx(fallback.clone());
-		h.session_store.insert_or_update(session).await.unwrap();
 		TestSession { session_id, persister, fallback }
 	}
 
@@ -1709,6 +1847,21 @@ mod tests {
 		PaymentId(txid.to_byte_array())
 	}
 
+	/// Resumes every session the resume task would.
+	async fn resume_all(h: &Harness) {
+		let (_stop_sender, stop_receiver) = tokio::sync::watch::channel(());
+		h.manager.resume_payjoin_sessions(stop_receiver).await.unwrap();
+	}
+
+	/// Moves the chain tip to where a transaction confirmed at `height` is buried.
+	async fn bury(h: &Harness, height: u32) {
+		chain_tip_changed(&h.wallet, height + ANTI_REORG_DELAY - 1).await;
+	}
+
+	async fn spend(h: &Harness, session_id: PaymentId) -> Option<SessionSpend> {
+		h.session_store.get(&session_id).await.unwrap().unwrap().spend
+	}
+
 	#[tokio::test]
 	async fn payjoin_settles_once_buried() {
 		let h = harness().await;
@@ -1718,16 +1871,20 @@ mod tests {
 		// We contributed an input of ours.
 		assert_eq!(payjoin.input.len(), 2);
 
-		// Seen unconfirmed: tagged, but the session stays open.
-		insert_confirmed_tx(&h.wallet, payjoin, 11);
-		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 2);
-		resume(&h, &session.persister).await.unwrap();
-		assert_eq!(status(&h, session.session_id).await, PayjoinSessionStatus::Active);
+		// Seen unconfirmed: tagged and recorded, but the session stays open.
+		observe_unconfirmed(&h.wallet, &payjoin).await;
+		assert_eq!(
+			spend(&h, session.session_id).await,
+			Some(SessionSpend { txid: payjoin_txid, kind: SpendKind::Payjoin })
+		);
 		let payment = recorded_payment(&h.wallet, &payment_id(payjoin_txid)).await.unwrap();
 		assert_eq!(tx_type(&payment), Some(TransactionType::Payjoin));
 
-		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 1);
-		resume(&h, &session.persister).await.unwrap();
+		observe_confirmed(&h.wallet, &payjoin, 11).await;
+		chain_tip_changed(&h.wallet, 11 + ANTI_REORG_DELAY - 2).await;
+		assert_eq!(status(&h, session.session_id).await, PayjoinSessionStatus::Active);
+
+		bury(&h, 11).await;
 		assert_eq!(
 			status(&h, session.session_id).await,
 			PayjoinSessionStatus::Completed { txid: Some(payjoin_txid) }
@@ -1736,9 +1893,26 @@ mod tests {
 			replay(&session.persister).await,
 			ReceiveSession::Closed(ReceiverSessionOutcome::PayjoinProposalSent)
 		));
+		// Nothing can follow the close.
+		assert!(session.persister.save_event(unit_event("PostedPayjoinProposal")).await.is_err());
 		// The sender's input is spent past the reorg bar, so it's forgotten.
 		assert!(h.manager.payjoin_seen_inputs_store.get(&outpoint(1, 0)).await.unwrap().is_none());
 		assert!(broadcast_txs(&h).await.is_empty());
+	}
+
+	#[tokio::test]
+	async fn spend_first_seen_buried_settles_at_once() {
+		let h = harness().await;
+		let session = session_with_original(&h, &[outpoint(1, 0)], NEVER_EXPIRES).await;
+		let payjoin = propose(&h, &session).await;
+
+		// Wallet sync only catches up once the payjoin is buried already, e.g. after downtime.
+		set_chain_tip(&h.wallet, 30);
+		observe_confirmed(&h.wallet, &payjoin, 11).await;
+		assert_eq!(
+			status(&h, session.session_id).await,
+			PayjoinSessionStatus::Completed { txid: Some(payjoin.compute_txid()) }
+		);
 	}
 
 	#[tokio::test]
@@ -1754,16 +1928,25 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn session_pauses_while_the_senders_inputs_are_spent_shallowly() {
+	async fn session_pauses_while_a_spend_waits_to_be_buried() {
 		let h = harness().await;
 		let session = session_with_original(&h, &[outpoint(1, 0)], NEVER_EXPIRES).await;
 		// The sender gave up on the payjoin and broadcast its original.
-		insert_unconfirmed_tx(&h.wallet, session.fallback.clone());
+		observe_unconfirmed(&h.wallet, &session.fallback).await;
+		assert_eq!(
+			spend(&h, session.session_id).await,
+			Some(SessionSpend { txid: session.fallback.compute_txid(), kind: SpendKind::Fallback })
+		);
 
-		resume(&h, &session.persister).await.unwrap();
-		// Nothing advanced: a proposal could no longer confirm.
+		// Nothing advances: a proposal could no longer confirm.
+		resume_all(&h).await;
 		assert!(matches!(replay(&session.persister).await, ReceiveSession::MaybeInputsOwned(_)));
-		assert_eq!(status(&h, session.session_id).await, PayjoinSessionStatus::Active);
+
+		// The original dropped out of the mempool, so the session goes on.
+		observe_dropped(&h.wallet, &session.fallback).await;
+		assert_eq!(spend(&h, session.session_id).await, None);
+		resume_all(&h).await;
+		assert!(matches!(replay(&session.persister).await, ReceiveSession::PayjoinProposal(_)));
 	}
 
 	#[tokio::test]
@@ -1773,17 +1956,16 @@ mod tests {
 		propose(&h, &session).await;
 		let fallback_txid = session.fallback.compute_txid();
 
-		insert_confirmed_tx(&h.wallet, session.fallback.clone(), 11);
-		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 1);
-		resume(&h, &session.persister).await.unwrap();
+		observe_confirmed(&h.wallet, &session.fallback, 11).await;
+		bury(&h, 11).await;
 
 		assert_eq!(
 			status(&h, session.session_id).await,
 			PayjoinSessionStatus::Failed { txid: Some(fallback_txid) }
 		);
 		assert!(matches!(replay(&session.persister).await, ReceiveSession::Closed(_)));
-		let payment = recorded_payment(&h.wallet, &payment_id(fallback_txid)).await;
-		assert!(payment.map_or(true, |payment| tx_type(&payment).is_none()));
+		let payment = recorded_payment(&h.wallet, &payment_id(fallback_txid)).await.unwrap();
+		assert_eq!(tx_type(&payment), None);
 		assert!(h.manager.payjoin_seen_inputs_store.get(&outpoint(1, 0)).await.unwrap().is_none());
 		assert!(broadcast_txs(&h).await.is_empty());
 	}
@@ -1797,9 +1979,12 @@ mod tests {
 
 		// The sender double-spent one of its inputs to us in some other transaction.
 		let double_spend = tx_spending(&h.wallet, spent);
-		insert_confirmed_tx(&h.wallet, double_spend.clone(), 11);
-		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 1);
-		resume(&h, &session.persister).await.unwrap();
+		observe_confirmed(&h.wallet, &double_spend, 11).await;
+		assert_eq!(
+			spend(&h, session.session_id).await.map(|spend| spend.kind),
+			Some(SpendKind::Unrecognized)
+		);
+		bury(&h, 11).await;
 
 		assert_eq!(
 			status(&h, session.session_id).await,
@@ -1810,7 +1995,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn payjoin_replaced_by_the_fallback_has_its_payment_failed() {
+	async fn payjoin_replaced_by_the_fallback_loses_its_tag() {
 		let h = harness().await;
 		let session = session_with_original(&h, &[outpoint(1, 0)], NEVER_EXPIRES).await;
 		let payjoin = propose(&h, &session).await;
@@ -1818,15 +2003,48 @@ mod tests {
 		let fallback_txid = session.fallback.compute_txid();
 
 		observe_unconfirmed(&h.wallet, &payjoin).await;
-		resume(&h, &session.persister).await.unwrap();
 		let payment = recorded_payment(&h.wallet, &payjoin_id).await.unwrap();
 		assert_eq!(tx_type(&payment), Some(TransactionType::Payjoin));
 		assert_eq!(payment.status, PaymentStatus::Pending);
 
 		// The fallback confirms instead, e.g. after a reorg, and the payjoin can't any more.
-		insert_confirmed_tx(&h.wallet, session.fallback.clone(), 11);
-		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 1);
-		resume(&h, &session.persister).await.unwrap();
+		observe_replaced(&h.wallet, &payjoin, &session.fallback, 11).await;
+		assert_eq!(
+			spend(&h, session.session_id).await,
+			Some(SessionSpend { txid: fallback_txid, kind: SpendKind::Fallback })
+		);
+		bury(&h, 11).await;
+
+		assert_eq!(
+			status(&h, session.session_id).await,
+			PayjoinSessionStatus::Failed { txid: Some(fallback_txid) }
+		);
+		// Wallet sync recorded the fallback as the payjoin's replacement, in the payjoin's record,
+		// which no longer holds a payjoin.
+		let payment = recorded_payment(&h.wallet, &payjoin_id).await.unwrap();
+		assert!(matches!(payment.kind, PaymentKind::Onchain { txid, .. } if txid == fallback_txid));
+		assert_eq!(payment.status, PaymentStatus::Succeeded);
+		assert_eq!(tx_type(&payment), None);
+	}
+
+	#[tokio::test]
+	async fn payjoin_dropped_before_the_fallback_confirms_has_its_payment_failed() {
+		let h = harness().await;
+		let session = session_with_original(&h, &[outpoint(1, 0)], NEVER_EXPIRES).await;
+		let payjoin = propose(&h, &session).await;
+		let payjoin_id = payment_id(payjoin.compute_txid());
+		let fallback_txid = session.fallback.compute_txid();
+
+		observe_unconfirmed(&h.wallet, &payjoin).await;
+		// Dropped from the mempool, so the fallback confirming later isn't its replacement to
+		// wallet sync, and its payment stays pending.
+		observe_dropped(&h.wallet, &payjoin).await;
+		observe_confirmed(&h.wallet, &session.fallback, 11).await;
+		assert_eq!(
+			recorded_payment(&h.wallet, &payjoin_id).await.unwrap().status,
+			PaymentStatus::Pending
+		);
+		bury(&h, 11).await;
 
 		assert_eq!(
 			status(&h, session.session_id).await,
@@ -1835,6 +2053,8 @@ mod tests {
 		let payment = recorded_payment(&h.wallet, &payjoin_id).await.unwrap();
 		assert_eq!(payment.status, PaymentStatus::Failed);
 		assert_eq!(tx_type(&payment), Some(TransactionType::Payjoin));
+		let fallback = recorded_payment(&h.wallet, &payment_id(fallback_txid)).await.unwrap();
+		assert_eq!(fallback.status, PaymentStatus::Succeeded);
 	}
 
 	#[tokio::test]
@@ -1887,9 +2107,9 @@ mod tests {
 			Err(Error::InvalidPaymentId)
 		));
 
-		// A spend of the sender's inputs was seen.
+		// Wallet sync saw a spend of the sender's inputs.
 		let session = session_with_original(&h, &[outpoint(1, 0)], NEVER_EXPIRES).await;
-		insert_unconfirmed_tx(&h.wallet, session.fallback.clone());
+		observe_unconfirmed(&h.wallet, &session.fallback).await;
 		assert!(matches!(
 			h.manager.cancel_session(session.session_id).await,
 			Err(Error::PayjoinSessionNotCancellable)
@@ -1898,9 +2118,8 @@ mod tests {
 		// The session ended.
 		let session = session_with_original(&h, &[outpoint(2, 0)], NEVER_EXPIRES).await;
 		let payjoin = propose(&h, &session).await;
-		insert_confirmed_tx(&h.wallet, payjoin, 11);
-		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 1);
-		resume(&h, &session.persister).await.unwrap();
+		observe_confirmed(&h.wallet, &payjoin, 11).await;
+		bury(&h, 11).await;
 		assert!(matches!(
 			h.manager.cancel_session(session.session_id).await,
 			Err(Error::PayjoinSessionNotCancellable)
@@ -1914,8 +2133,7 @@ mod tests {
 		let session = session_with_original(&h, &[outpoint(1, 0)], 1_600_000_000).await;
 		let fallback_txid = session.fallback.compute_txid();
 
-		let (_stop_sender, stop_receiver) = tokio::sync::watch::channel(());
-		h.manager.resume_payjoin_sessions(stop_receiver).await.unwrap();
+		resume_all(&h).await;
 		assert_eq!(
 			status(&h, session.session_id).await,
 			PayjoinSessionStatus::FallbackPending { fallback_txid }
@@ -1928,18 +2146,18 @@ mod tests {
 		h.manager.rebroadcast_pending_fallbacks().await;
 		assert!(broadcast_txs(&h).await.is_empty());
 
-		insert_confirmed_tx(&h.wallet, session.fallback.clone(), 11);
-		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 1);
-		h.manager.rebroadcast_pending_fallbacks().await;
+		observe_confirmed(&h.wallet, &session.fallback, 11).await;
+		bury(&h, 11).await;
 		assert_eq!(
 			status(&h, session.session_id).await,
 			PayjoinSessionStatus::Failed { txid: Some(fallback_txid) }
 		);
+		h.manager.rebroadcast_pending_fallbacks().await;
 		assert!(broadcast_txs(&h).await.is_empty());
 	}
 
 	#[tokio::test]
-	async fn pending_fallback_beaten_by_the_payjoin_has_its_payment_failed() {
+	async fn pending_fallback_beaten_by_the_payjoin_settles() {
 		let h = harness().await;
 		let session = session_with_original(&h, &[outpoint(1, 0)], NEVER_EXPIRES).await;
 		let payjoin = propose(&h, &session).await;
@@ -1956,17 +2174,17 @@ mod tests {
 		);
 
 		// But the sender broadcast the payjoin it had, which confirms.
-		insert_confirmed_tx(&h.wallet, payjoin, 11);
-		set_chain_tip(&h.wallet, 11 + ANTI_REORG_DELAY - 1);
-		h.manager.rebroadcast_pending_fallbacks().await;
+		observe_replaced(&h.wallet, &session.fallback, &payjoin, 11).await;
+		bury(&h, 11).await;
 
 		let recorded = h.session_store.get(&session.session_id).await.unwrap().unwrap();
 		assert_eq!(recorded.status, PayjoinStatus::Failed);
 		assert_eq!(recorded.resolution_txid, Some(payjoin_txid));
-		assert_eq!(
-			recorded_payment(&h.wallet, &fallback_id).await.unwrap().status,
-			PaymentStatus::Failed
-		);
+		// Wallet sync recorded the payjoin as the fallback's replacement, in the fallback's record.
+		let payment = recorded_payment(&h.wallet, &fallback_id).await.unwrap();
+		assert!(matches!(payment.kind, PaymentKind::Onchain { txid, .. } if txid == payjoin_txid));
+		assert_eq!(payment.status, PaymentStatus::Succeeded);
+		h.manager.rebroadcast_pending_fallbacks().await;
 	}
 
 	#[tokio::test]

@@ -71,15 +71,32 @@ impl AsyncSessionPersister for KVStorePayjoinReceiverPersister {
 			};
 
 			let new_session = self.new_session.clone();
+			let mut closed = false;
 			self.payjoin_session_store
 				.mutate(&self.session_id, |existing| {
 					// Create the record with its first event if it doesn't exist yet
 					let mut session = existing.cloned().or(new_session)?;
+					// Nothing follows a session's close, or its log would no longer replay. Both
+					// the resume task and wallet sync can close a session, so the second to try
+					// is refused here.
+					closed = session.events.last().is_some_and(|last| {
+						matches!(
+							serde_json::from_slice(&last.event_bytes),
+							Ok(ReceiverSessionEvent::Closed(_))
+						)
+					});
+					if closed {
+						return None;
+					}
 					session.events.push(event);
 					Some(session)
 				})
 				.await?
-				.ok_or(Error::InvalidPaymentId)?;
+				.ok_or(if closed {
+					Error::PayjoinSessionFailed
+				} else {
+					Error::InvalidPaymentId
+				})?;
 
 			Ok(())
 		}

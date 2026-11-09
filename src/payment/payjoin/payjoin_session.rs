@@ -7,7 +7,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bitcoin::{Transaction, Txid};
+use bitcoin::Txid;
 use lightning::ln::channelmanager::PaymentId;
 use lightning::{impl_writeable_tlv_based, impl_writeable_tlv_based_enum};
 
@@ -23,10 +23,14 @@ pub struct PayjoinSession {
 	/// The kind of session.
 	pub kind: PayjoinSessionKind,
 
-	/// The transaction to broadcast if the payjoin session fails or is aborted.
-	pub fallback_tx: Option<Transaction>,
-
-	/// Serialized session events
+	/// Serialized session events.
+	///
+	/// Only ever appended to by the [`KVStorePayjoinReceiverPersister`] through
+	/// [`DataStore::mutate`], and left out of [`PayjoinSessionUpdate`], so a write of a copy read
+	/// before an event was appended can't drop it.
+	///
+	/// [`KVStorePayjoinReceiverPersister`]: crate::payment::payjoin::persist::KVStorePayjoinReceiverPersister
+	/// [`DataStore::mutate`]: crate::data_store::DataStore::mutate
 	pub events: Vec<SerializedSessionEvent>,
 
 	/// Current status of the session
@@ -50,7 +54,48 @@ pub struct PayjoinSession {
 	/// The transaction that settled the session, once known: the payjoin, the fallback, or another
 	/// spend of the sender's inputs.
 	pub resolution_txid: Option<Txid>,
+
+	/// The latest transaction wallet sync saw spending the sender's inputs, as classified against
+	/// the session, until it's confirmed through `ANTI_REORG_DELAY` and settles the session. While
+	/// there is one, the session isn't advanced any further and can't be cancelled.
+	///
+	/// Only ever set through [`DataStore::mutate`], and left out of [`PayjoinSessionUpdate`], for
+	/// the same reason as [`Self::cancel_requested`].
+	///
+	/// [`DataStore::mutate`]: crate::data_store::DataStore::mutate
+	pub spend: Option<SessionSpend>,
 }
+
+/// A transaction spending the sender's inputs, as classified against a [`PayjoinSession`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionSpend {
+	/// The transaction.
+	pub txid: Txid,
+	/// What it is to the session.
+	pub kind: SpendKind,
+}
+
+impl_writeable_tlv_based!(SessionSpend, {
+	(0, txid, required),
+	(2, kind, required),
+});
+
+/// What a transaction spending the sender's inputs is to a session, as payjoin's `ResolvedBy`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SpendKind {
+	/// The payjoin proposal.
+	Payjoin,
+	/// The sender's fallback transaction.
+	Fallback,
+	/// Neither, e.g. a fee bump or a double-spend by the sender.
+	Unrecognized,
+}
+
+impl_writeable_tlv_based_enum!(SpendKind,
+	(0, Payjoin) => {},
+	(2, Fallback) => {},
+	(4, Unrecognized) => {}
+);
 
 impl PayjoinSession {
 	pub fn new(session_id: PaymentId, kind: PayjoinSessionKind) -> Self {
@@ -61,31 +106,21 @@ impl PayjoinSession {
 		Self {
 			session_id,
 			kind,
-			fallback_tx: None,
 			events: Vec::new(),
 			status: PayjoinStatus::Active,
 			completed_at: None,
 			latest_update_timestamp,
 			cancel_requested: false,
 			resolution_txid: None,
+			spend: None,
 		}
 	}
 
-	/// Returns the fallback transaction to broadcast if the payjoin doesn't complete, if known.
-	pub(crate) fn fallback_tx(&self) -> Option<&Transaction> {
-		self.fallback_tx.as_ref()
-	}
-
-	/// Records the fallback transaction to broadcast if the payjoin doesn't complete.
-	pub(crate) fn set_fallback_tx(&mut self, tx: Transaction) {
-		self.fallback_tx = Some(tx);
-	}
-
-	/// The session's status as reported to the user by [`PayjoinPayment::status`].
+	/// The session's status as reported to the user by [`PayjoinPayment::status`], given the
+	/// txid of the session's fallback transaction, if it has one.
 	///
 	/// [`PayjoinPayment::status`]: crate::payment::PayjoinPayment::status
-	pub(crate) fn user_status(&self) -> PayjoinSessionStatus {
-		let fallback_txid = self.fallback_tx().map(|tx| tx.compute_txid());
+	pub(crate) fn user_status(&self, fallback_txid: Option<Txid>) -> PayjoinSessionStatus {
 		match self.status {
 			PayjoinStatus::Active => PayjoinSessionStatus::Active,
 			PayjoinStatus::Completed => {
@@ -107,13 +142,13 @@ impl PayjoinSession {
 impl_writeable_tlv_based!(PayjoinSession, {
 	(0, session_id, required),
 	(2, kind, required),
-	(4, fallback_tx, option),
 	(6, events, required_vec),
 	(8, status, required),
 	(10, completed_at, option),
 	(12, latest_update_timestamp, (default_value, 0u64)),
 	(14, cancel_requested, (default_value, false)),
 	(16, resolution_txid, option),
+	(18, spend, option),
 });
 
 /// The direction-specific data of a [`PayjoinSession`].
@@ -163,8 +198,6 @@ impl_writeable_tlv_based_enum!(PayjoinStatus,
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PayjoinSessionUpdate {
 	pub session_id: PaymentId,
-	pub fallback_tx: Option<Option<Transaction>>,
-	pub events: Option<Vec<SerializedSessionEvent>>,
 	pub status: Option<PayjoinStatus>,
 	pub completed_at: Option<Option<u64>>,
 	pub resolution_txid: Option<Option<Txid>>,
@@ -174,8 +207,6 @@ impl From<&PayjoinSession> for PayjoinSessionUpdate {
 	fn from(value: &PayjoinSession) -> Self {
 		Self {
 			session_id: value.session_id,
-			fallback_tx: Some(value.fallback_tx.clone()),
-			events: Some(value.events.clone()),
 			status: Some(value.status),
 			completed_at: Some(value.completed_at),
 			resolution_txid: Some(value.resolution_txid),
@@ -211,12 +242,6 @@ impl UpdatableObject for PayjoinSession {
 			};
 		}
 
-		if let Some(fallback_tx_opt) = update.fallback_tx {
-			update_if_necessary!(self.fallback_tx, fallback_tx_opt);
-		}
-		if let Some(events_opt) = &update.events {
-			update_if_necessary!(self.events, events_opt.clone());
-		}
 		if let Some(status_opt) = update.status {
 			update_if_necessary!(self.status, status_opt);
 		}
@@ -250,114 +275,81 @@ impl StorableObjectUpdate<PayjoinSession> for PayjoinSessionUpdate {
 
 #[cfg(test)]
 mod tests {
-	use bitcoin::absolute::LockTime;
 	use bitcoin::hashes::Hash;
-	use bitcoin::transaction::Version;
-	use bitcoin::{Amount, ScriptBuf, TxIn, TxOut};
 	use lightning::util::ser::{Readable, Writeable};
 
 	use super::*;
 
-	fn dummy_tx() -> Transaction {
-		Transaction {
-			version: Version::TWO,
-			lock_time: LockTime::ZERO,
-			input: vec![TxIn::default()],
-			output: vec![TxOut {
-				value: Amount::from_sat(10_000),
-				script_pubkey: ScriptBuf::new(),
-			}],
-		}
+	fn txid(byte: u8) -> Txid {
+		Txid::from_byte_array([byte; 32])
 	}
 
 	#[test]
 	fn receive_session_round_trips() {
 		let mut session = PayjoinSession::new(PaymentId([7; 32]), PayjoinSessionKind::Receive);
-		assert_eq!(session.fallback_tx(), None);
-
-		session.set_fallback_tx(dummy_tx());
 		session.events.push(SerializedSessionEvent { event_bytes: vec![1, 2, 3], created_at: 42 });
 		session.status = PayjoinStatus::Completed;
 		session.completed_at = Some(43);
-
-		let decoded = PayjoinSession::read(&mut &session.encode()[..]).unwrap();
-		assert_eq!(decoded, session);
-		assert_eq!(decoded.fallback_tx(), Some(&dummy_tx()));
-	}
-
-	#[test]
-	fn fallback_pending_session_round_trips() {
-		let mut session = PayjoinSession::new(PaymentId([8; 32]), PayjoinSessionKind::Receive);
-		session.set_fallback_tx(dummy_tx());
-		session.status = PayjoinStatus::FallbackPending;
-		session.completed_at = Some(44);
-
-		let decoded = PayjoinSession::read(&mut &session.encode()[..]).unwrap();
-		assert_eq!(decoded.status, PayjoinStatus::FallbackPending);
-		assert_eq!(decoded.fallback_tx(), Some(&dummy_tx()));
-	}
-
-	#[test]
-	fn cancel_and_resolution_round_trip() {
-		let mut session = PayjoinSession::new(PaymentId([9; 32]), PayjoinSessionKind::Receive);
 		session.cancel_requested = true;
-		session.resolution_txid = Some(dummy_tx().compute_txid());
+		session.resolution_txid = Some(txid(1));
+		session.spend = Some(SessionSpend { txid: txid(1), kind: SpendKind::Payjoin });
 
 		let decoded = PayjoinSession::read(&mut &session.encode()[..]).unwrap();
 		assert_eq!(decoded, session);
 	}
 
 	#[test]
-	fn stale_write_keeps_cancel_request() {
+	fn stale_write_keeps_what_only_mutate_sets() {
 		let stale = PayjoinSession::new(PaymentId([10; 32]), PayjoinSessionKind::Receive);
 		let mut current = stale.clone();
 		current.cancel_requested = true;
+		current.spend = Some(SessionSpend { txid: txid(2), kind: SpendKind::Fallback });
+		current.events.push(SerializedSessionEvent { event_bytes: vec![1], created_at: 1 });
 
-		// What `insert_or_update` of a copy read before the request applies.
+		// What `insert_or_update` of a copy read before those writes applies.
 		current.update(stale.to_update());
 		assert!(current.cancel_requested);
+		assert_eq!(current.spend, Some(SessionSpend { txid: txid(2), kind: SpendKind::Fallback }));
+		assert_eq!(current.events.len(), 1);
 	}
 
 	#[test]
 	fn user_status_reports_outcome_and_cancellation() {
-		let fallback_txid = dummy_tx().compute_txid();
-		let other_txid = Txid::from_byte_array([11; 32]);
-		let session = |status, cancel_requested, fallback: bool, resolution_txid| {
+		let fallback_txid = txid(3);
+		let other_txid = txid(4);
+		let status = |status, cancel_requested, fallback: bool, resolution_txid| {
 			let mut session = PayjoinSession::new(PaymentId([12; 32]), PayjoinSessionKind::Receive);
 			session.status = status;
 			session.cancel_requested = cancel_requested;
-			if fallback {
-				session.set_fallback_tx(dummy_tx());
-			}
 			session.resolution_txid = resolution_txid;
-			session.user_status()
+			session.user_status(fallback.then_some(fallback_txid))
 		};
 
 		// A requested cancellation isn't reported until it's applied.
-		assert_eq!(session(PayjoinStatus::Active, true, true, None), PayjoinSessionStatus::Active);
+		assert_eq!(status(PayjoinStatus::Active, true, true, None), PayjoinSessionStatus::Active);
 		assert_eq!(
-			session(PayjoinStatus::Completed, false, true, Some(other_txid)),
+			status(PayjoinStatus::Completed, false, true, Some(other_txid)),
 			PayjoinSessionStatus::Completed { txid: Some(other_txid) }
 		);
 		// Cancelling can't undo a payjoin that completed before it was applied.
 		assert_eq!(
-			session(PayjoinStatus::Completed, true, true, Some(other_txid)),
+			status(PayjoinStatus::Completed, true, true, Some(other_txid)),
 			PayjoinSessionStatus::Completed { txid: Some(other_txid) }
 		);
 		assert_eq!(
-			session(PayjoinStatus::FallbackPending, false, true, None),
+			status(PayjoinStatus::FallbackPending, false, true, None),
 			PayjoinSessionStatus::FallbackPending { fallback_txid }
 		);
 		assert_eq!(
-			session(PayjoinStatus::Failed, false, true, Some(fallback_txid)),
+			status(PayjoinStatus::Failed, false, true, Some(fallback_txid)),
 			PayjoinSessionStatus::Failed { txid: Some(fallback_txid) }
 		);
 		assert_eq!(
-			session(PayjoinStatus::FallbackPending, true, true, None),
+			status(PayjoinStatus::FallbackPending, true, true, None),
 			PayjoinSessionStatus::Cancelled { fallback_txid: Some(fallback_txid) }
 		);
 		assert_eq!(
-			session(PayjoinStatus::Failed, true, false, None),
+			status(PayjoinStatus::Failed, true, false, None),
 			PayjoinSessionStatus::Cancelled { fallback_txid: None }
 		);
 	}

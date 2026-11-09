@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::ops::Deref;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use bdk_chain::spk_client::{FullScanRequest, SyncRequest};
 use bdk_chain::ChainPosition;
@@ -65,6 +65,7 @@ use crate::data_store::{KeepAllEntries, KeepLeastRecentlyUsed};
 use crate::data_store::{StorableObject, UpdatableObject};
 use crate::fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 use crate::logger::{log_debug, log_error, log_info, log_trace, log_warn, LdkLogger, Logger};
+use crate::payment::payjoin::manager::PayjoinManager;
 use crate::payment::pending_payment_store::PendingPaymentDetailsUpdate;
 use crate::payment::store::{Channel, ConfirmationStatus, PaymentDetailsUpdate};
 use crate::payment::{
@@ -88,19 +89,6 @@ pub(crate) enum OnchainSendAmount {
 pub(crate) enum FundingAmount {
 	Exact { amount_sats: u64 },
 	Max,
-}
-
-/// Where a payjoin fallback transaction stands, as returned by
-/// [`Wallet::payjoin_fallback_status`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum PayjoinFallbackStatus {
-	/// Neither the fallback nor a transaction double-spending it has confirmed through
-	/// [`ANTI_REORG_DELAY`], so the fallback may still need broadcasting.
-	Unresolved,
-	/// The fallback confirmed through [`ANTI_REORG_DELAY`].
-	Confirmed,
-	/// This transaction, double-spending the fallback, confirmed through [`ANTI_REORG_DELAY`].
-	Conflicted(Transaction),
 }
 
 mod payment_stores;
@@ -193,6 +181,9 @@ pub(crate) struct Wallet {
 	// How far the dropping of recorded facts has walked the store, and how many records the
 	// store contains.
 	facts_retention: FactsRetention,
+	// Where to report the transactions wallet sync sees, set once payjoin is configured, so payjoin
+	// receive sessions can settle on them.
+	payjoin_manager: OnceLock<Weak<PayjoinManager>>,
 }
 
 impl Wallet {
@@ -223,6 +214,19 @@ impl Wallet {
 			channel_tx_facts_store,
 			channel_liveness: OnceLock::new(),
 			facts_retention: FactsRetention::new(),
+			payjoin_manager: OnceLock::new(),
+		}
+	}
+
+	/// Tells the wallet to report the transactions it sees to the payjoin manager.
+	///
+	/// Wallet sync is the only thing that classifies transactions against payjoin receive
+	/// sessions, so the manager hears of each new transaction, each one dropped or replaced, and
+	/// each one buried through [`ANTI_REORG_DELAY`]. A report that fails fails the sync pass, so
+	/// the pass, and the report, are retried.
+	pub(crate) fn set_payjoin_manager(&self, payjoin_manager: Weak<PayjoinManager>) {
+		if self.payjoin_manager.set(payjoin_manager).is_err() {
+			debug_assert!(false, "The wallet is told about the payjoin manager once");
 		}
 	}
 
@@ -560,9 +564,16 @@ impl Wallet {
 			});
 		}
 
+		let payjoin_manager = self.payjoin_manager.get().and_then(Weak::upgrade);
+		// Reported to the payjoin manager once the pass is through, outside the payment stores'
+		// lock, which the manager takes to tag or fail the payments it settles on.
+		let mut seen_txs: Vec<Arc<Transaction>> = Vec::new();
+		let mut gone_txids: Vec<Txid> = Vec::new();
+
 		for event in events {
 			match event {
 				WalletEvent::TxConfirmed { txid, tx, block_time, .. } => {
+					seen_txs.push(Arc::clone(&tx));
 					let cur_height = self.inner.lock().expect("lock").latest_checkpoint().height();
 					let confirmation_height = block_time.block_id.height;
 					let payment_status = if cur_height >= confirmation_height + ANTI_REORG_DELAY - 1
@@ -571,6 +582,12 @@ impl Wallet {
 					} else {
 						PaymentStatus::Pending
 					};
+					// First seen already buried, e.g. after downtime, so it never graduates below.
+					if payment_status == PaymentStatus::Succeeded {
+						if let Some(payjoin_manager) = &payjoin_manager {
+							payjoin_manager.on_tx_buried(txid).await?;
+						}
+					}
 
 					let confirmation_status = ConfirmationStatus::Confirmed {
 						block_hash: block_time.block_id.hash,
@@ -688,6 +705,7 @@ impl Wallet {
 
 						match details.kind {
 							PaymentKind::Onchain {
+								txid,
 								status: ConfirmationStatus::Confirmed { height, .. },
 								..
 							} => {
@@ -703,6 +721,12 @@ impl Wallet {
 									// snapshot (or was removed) declines, leaving future
 									// events to drive it.
 									let mut graduated = false;
+									// Reported before the payment graduates: a graduated payment never
+									// graduates again, so a report that fails must leave it pending
+									// for the next chain tip to report again.
+									if let Some(payjoin_manager) = &payjoin_manager {
+										payjoin_manager.on_tx_buried(txid).await?;
+									}
 									// Taken per payment: the conflict check on unconfirmed payments below
 									// takes the lock itself.
 									let stores = self.payment_stores.lock().await;
@@ -785,6 +809,7 @@ impl Wallet {
 					}
 				},
 				WalletEvent::TxUnconfirmed { txid, tx, .. } => {
+					seen_txs.push(Arc::clone(&tx));
 					// See `TxConfirmed`: id resolution and the writes below must not interleave
 					// with the funding-record writers.
 					let stores = self.payment_stores.lock().await;
@@ -841,6 +866,7 @@ impl Wallet {
 					self.upsert_pending_payment(&stores, payment, Vec::new()).await?;
 				},
 				WalletEvent::TxReplaced { txid, conflicts, .. } => {
+					gone_txids.push(txid);
 					// See `TxConfirmed`: id resolution and the writes below must not interleave
 					// with the funding-record writers. The pending entry written below embeds a
 					// read of the payment record, which must not go stale against a concurrent
@@ -890,6 +916,7 @@ impl Wallet {
 					self.upsert_pending_payment(&stores, payment, conflict_txids).await?;
 				},
 				WalletEvent::TxDropped { txid, tx } => {
+					gone_txids.push(txid);
 					// See `TxConfirmed`: id resolution and the writes below must not interleave
 					// with the funding-record writers.
 					let stores = self.payment_stores.lock().await;
@@ -949,6 +976,12 @@ impl Wallet {
 					continue;
 				},
 			};
+		}
+
+		if let Some(payjoin_manager) = payjoin_manager {
+			// Gone first, so a replacement seen in the same pass is what sticks.
+			payjoin_manager.on_txs_gone(&gone_txids).await?;
+			payjoin_manager.on_txs_seen(&seen_txs).await?;
 		}
 
 		Ok(())
@@ -3118,6 +3151,10 @@ impl Wallet {
 	/// late funding classification, this merges only the classification into an existing record
 	/// and leaves its figures, status and confirmation state to wallet sync. If no record exists
 	/// yet, one is created from `tx` and marked as pending.
+	///
+	/// The record is found as wallet sync finds it, so it may be one first written for a
+	/// transaction `txid` replaced. A record that holds another transaction by now, e.g. the
+	/// payjoin's replacement, is left alone.
 	pub(crate) async fn classify_payjoin(
 		&self, txid: Txid, tx: Option<&Transaction>,
 	) -> Result<(), Error> {
@@ -3125,7 +3162,11 @@ impl Wallet {
 		// the record and its pending index out of step.
 		let stores = self.payment_stores.lock().await;
 
-		let id = PaymentId(txid.to_byte_array());
+		let id = self.find_payment_by_txid(txid).await?.unwrap_or(PaymentId(txid.to_byte_array()));
+		let holds_txid = |payment: &PaymentDetails| matches!(payment.kind, PaymentKind::Onchain { txid: recorded, .. } if recorded == txid);
+		if stores.payment(&id).await?.is_some_and(|payment| !holds_txid(&payment)) {
+			return Ok(());
+		}
 		let (amount_msat, fee_paid_msat, direction) = match tx {
 			Some(tx) => self.onchain_payment_fields(tx),
 			// Wallet sync fills the values in on its next event for this txid.
@@ -3179,32 +3220,44 @@ impl Wallet {
 		Ok(())
 	}
 
+	/// Clears the [`TransactionType::Payjoin`] tag of the payment holding `txid`, which settled a
+	/// payjoin but isn't the payjoin.
+	///
+	/// Wallet sync records a replacement in the record of the transaction it replaced, so a
+	/// payjoin's record keeps its tag after the fallback replaces it, e.g. in a reorg. A payment's
+	/// classification otherwise only ever gets more specific, which is why this edits the record
+	/// directly rather than through [`PaymentDetailsUpdate`].
+	pub(crate) async fn untag_payjoin(&self, txid: Txid) -> Result<(), Error> {
+		// Held across both stores, as in `classify_payjoin`.
+		let stores = self.payment_stores.lock().await;
+
+		let id = self.find_payment_by_txid(txid).await?.unwrap_or(PaymentId(txid.to_byte_array()));
+		let untag = |payment: &PaymentDetails| match payment.kind {
+			PaymentKind::Onchain {
+				txid: recorded,
+				status,
+				tx_type: Some(TransactionType::Payjoin),
+			} if recorded == txid => {
+				let mut untagged = payment.clone();
+				untagged.kind = PaymentKind::Onchain { txid, status, tx_type: None };
+				Some(untagged)
+			},
+			_ => None,
+		};
+		stores.mutate_payment(&id, |existing| untag(existing?)).await?;
+		stores
+			.mutate_pending_payment(&id, |existing| {
+				let mut entry = existing?.clone();
+				entry.details = Some(untag(entry.details.as_ref()?)?);
+				Some(entry)
+			})
+			.await?;
+		Ok(())
+	}
+
 	/// The hash of the wallet's chain tip.
 	pub(crate) fn best_block_hash(&self) -> bitcoin::BlockHash {
 		self.inner.lock().expect("lock").latest_checkpoint().hash()
-	}
-
-	/// Reports whether a payjoin fallback transaction still needs broadcasting.
-	///
-	/// The fallback spends the sender's inputs and pays us, so wallet sync picks it up, as it does
-	/// any competing spend of the sender's inputs that also pays us, such as the payjoin itself. A
-	/// competing spend paying only others never enters the wallet's graph, so to the wallet it
-	/// leaves the fallback unresolved.
-	pub(crate) fn payjoin_fallback_status(
-		&self, fallback_tx: &Transaction,
-	) -> PayjoinFallbackStatus {
-		let spends = self.spends_of_outpoints(fallback_tx.input.iter().map(|i| i.previous_output));
-		// Most confirmed first, so only the first can be buried deep enough.
-		match spends.into_iter().next() {
-			Some((tx, confirmations)) if confirmations >= ANTI_REORG_DELAY => {
-				if tx.compute_txid() == fallback_tx.compute_txid() {
-					PayjoinFallbackStatus::Confirmed
-				} else {
-					PayjoinFallbackStatus::Conflicted(tx)
-				}
-			},
-			_ => PayjoinFallbackStatus::Unresolved,
-		}
 	}
 
 	/// Records a funding payment the way the node does: the rounds this node signed supply the
@@ -3824,40 +3877,20 @@ impl Wallet {
 		Ok(psbt)
 	}
 
-	/// Returns the transactions in the wallet that spend any of `outpoints`, each with its number
-	/// of confirmations (0 while unconfirmed), most confirmed first.
-	///
-	/// Used to settle a payjoin: the payjoin, the sender's fallback, and any other spend of the
-	/// sender's inputs that pays us all reach the wallet through sync. A spend paying only others
-	/// never does.
-	pub(crate) fn spends_of_outpoints(
-		&self, outpoints: impl IntoIterator<Item = OutPoint>,
-	) -> Vec<(Transaction, u32)> {
+	/// Returns the canonical transaction `txid` with its number of confirmations (0 while
+	/// unconfirmed), or `None` if the wallet doesn't have it or it lost a conflict.
+	pub(crate) fn tx_with_confirmations(&self, txid: Txid) -> Option<(Transaction, u32)> {
 		let locked_wallet = self.inner.lock().expect("lock");
 		let tip_height = locked_wallet.latest_checkpoint().height();
-
-		let mut seen = HashSet::new();
-		let mut spends = Vec::new();
-		for outpoint in outpoints {
-			for spender in locked_wallet.tx_graph().outspends(outpoint) {
-				if !seen.insert(*spender) {
-					continue;
-				}
-				// `get_tx` is canonical-only, so a spend that lost a conflict doesn't count.
-				let Some(wallet_tx) = locked_wallet.get_tx(*spender) else {
-					continue;
-				};
-				let confirmations = match wallet_tx.chain_position {
-					ChainPosition::Confirmed { anchor, .. } => {
-						tip_height.saturating_sub(anchor.block_id.height).saturating_add(1)
-					},
-					ChainPosition::Unconfirmed { .. } => 0,
-				};
-				spends.push((wallet_tx.tx_node.tx.as_ref().clone(), confirmations));
-			}
-		}
-		spends.sort_by(|a, b| b.1.cmp(&a.1));
-		spends
+		// `get_tx` is canonical-only.
+		let wallet_tx = locked_wallet.get_tx(txid)?;
+		let confirmations = match wallet_tx.chain_position {
+			ChainPosition::Confirmed { anchor, .. } => {
+				tip_height.saturating_sub(anchor.block_id.height).saturating_add(1)
+			},
+			ChainPosition::Unconfirmed { .. } => 0,
+		};
+		Some((wallet_tx.tx_node.tx.as_ref().clone(), confirmations))
 	}
 
 	/// Returns the transactions in the wallet that spend an input of `tx` but lost the conflict,
@@ -5613,6 +5646,49 @@ pub(crate) mod tests {
 			old_block_time: None,
 		};
 		wallet.update_payment_store(vec![event]).await.unwrap();
+	}
+
+	/// Inserts `tx` into the BDK wallet as confirmed at `height`, and handles the sync event it
+	/// yields.
+	pub(crate) async fn observe_confirmed(wallet: &Wallet, tx: &Transaction, height: u32) {
+		insert_confirmed_tx(wallet, tx.clone(), height);
+		let event = WalletEvent::TxConfirmed {
+			txid: tx.compute_txid(),
+			tx: Arc::new(tx.clone()),
+			block_time: confirmed_block_time(height),
+			old_block_time: None,
+		};
+		wallet.update_payment_store(vec![event]).await.unwrap();
+	}
+
+	/// Evicts `tx` from the BDK wallet's view of the mempool, and handles the sync event it
+	/// yields.
+	pub(crate) async fn observe_dropped(wallet: &Wallet, tx: &Transaction) {
+		evict_tx(wallet, tx.compute_txid());
+		let event = WalletEvent::TxDropped { txid: tx.compute_txid(), tx: Arc::new(tx.clone()) };
+		wallet.update_payment_store(vec![event]).await.unwrap();
+	}
+
+	/// Confirms `replacement` at `height` in place of the conflicting `replaced`, and handles the
+	/// sync events it yields, as for a reorg or an RBF.
+	pub(crate) async fn observe_replaced(
+		wallet: &Wallet, replaced: &Transaction, replacement: &Transaction, height: u32,
+	) {
+		insert_confirmed_tx(wallet, replacement.clone(), height);
+		let events = vec![
+			WalletEvent::TxReplaced {
+				txid: replaced.compute_txid(),
+				tx: Arc::new(replaced.clone()),
+				conflicts: vec![(0, replacement.compute_txid())],
+			},
+			WalletEvent::TxConfirmed {
+				txid: replacement.compute_txid(),
+				tx: Arc::new(replacement.clone()),
+				block_time: confirmed_block_time(height),
+				old_block_time: None,
+			},
+		];
+		wallet.update_payment_store(events).await.unwrap();
 	}
 
 	/// Records the payment wallet sync creates for `tx` without the wallet taking the transaction
@@ -10004,7 +10080,7 @@ pub(crate) mod tests {
 	}
 
 	/// Runs the chain tip pass at `height`, which is where recorded facts are dropped.
-	async fn chain_tip_changed(wallet: &Wallet, height: u32) {
+	pub(crate) async fn chain_tip_changed(wallet: &Wallet, height: u32) {
 		set_chain_tip(wallet, height);
 		let event = WalletEvent::ChainTipChanged {
 			old_tip: block_id_at(height - 1),
@@ -10498,41 +10574,27 @@ pub(crate) mod tests {
 	}
 
 	#[tokio::test]
-	async fn spends_of_outpoints_lists_most_confirmed_first() {
+	async fn tx_with_confirmations_counts_canonical_confirmations() {
 		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
 		let wallet = new_test_wallet(store, false).await;
 		let [first, second] = payjoin_sender_outpoints();
-		assert!(wallet.spends_of_outpoints([first, second]).is_empty());
-
 		let unconfirmed = tx_spending(&wallet, first);
+		assert_eq!(wallet.tx_with_confirmations(unconfirmed.compute_txid()), None);
+
 		insert_unconfirmed_tx(&wallet, unconfirmed.clone());
-		assert_eq!(wallet.spends_of_outpoints([first, second]), vec![(unconfirmed.clone(), 0)]);
+		assert_eq!(
+			wallet.tx_with_confirmations(unconfirmed.compute_txid()),
+			Some((unconfirmed.clone(), 0))
+		);
 
 		let confirmed = tx_spending(&wallet, second);
 		insert_confirmed_tx(&wallet, confirmed.clone(), 10);
 		set_chain_tip(&wallet, 12);
-		assert_eq!(
-			wallet.spends_of_outpoints([first, second]),
-			vec![(confirmed, 3), (unconfirmed.clone(), 0)]
-		);
+		assert_eq!(wallet.tx_with_confirmations(confirmed.compute_txid()), Some((confirmed, 3)));
 
-		// Only spends of the given outpoints count.
-		assert_eq!(wallet.spends_of_outpoints([first]), vec![(unconfirmed, 0)]);
-	}
-
-	#[tokio::test]
-	async fn spends_of_outpoints_lists_a_spend_once_and_skips_non_canonical() {
-		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
-		let wallet = new_test_wallet(store, false).await;
-		let [first, second] = payjoin_sender_outpoints();
-
-		let mut spend = tx_spending(&wallet, first);
-		spend.input.push(bitcoin::TxIn { previous_output: second, ..Default::default() });
-		insert_unconfirmed_tx(&wallet, spend.clone());
-		assert_eq!(wallet.spends_of_outpoints([first, second]), vec![(spend.clone(), 0)]);
-
-		evict_tx(&wallet, spend.compute_txid());
-		assert!(wallet.spends_of_outpoints([first, second]).is_empty());
+		// One that is no longer canonical isn't returned.
+		evict_tx(&wallet, unconfirmed.compute_txid());
+		assert_eq!(wallet.tx_with_confirmations(unconfirmed.compute_txid()), None);
 	}
 
 	#[tokio::test]
@@ -10596,46 +10658,5 @@ pub(crate) mod tests {
 		let payment =
 			wallet.payment_stores.payment_store().get(&payment_id).await.unwrap().unwrap();
 		assert_eq!(payment.status, PaymentStatus::Pending);
-	}
-
-	#[tokio::test]
-	async fn payjoin_fallback_stays_unresolved_until_buried() {
-		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
-		let wallet = new_test_wallet(store, false).await;
-		let fallback = tx_spending(&wallet, payjoin_sender_outpoints()[0]);
-
-		// Not yet seen by wallet sync.
-		assert_eq!(wallet.payjoin_fallback_status(&fallback), PayjoinFallbackStatus::Unresolved);
-
-		insert_unconfirmed_tx(&wallet, fallback.clone());
-		assert_eq!(wallet.payjoin_fallback_status(&fallback), PayjoinFallbackStatus::Unresolved);
-
-		insert_confirmed_tx(&wallet, fallback.clone(), 10);
-		set_chain_tip(&wallet, 10 + ANTI_REORG_DELAY - 2);
-		assert_eq!(wallet.payjoin_fallback_status(&fallback), PayjoinFallbackStatus::Unresolved);
-
-		set_chain_tip(&wallet, 10 + ANTI_REORG_DELAY - 1);
-		assert_eq!(wallet.payjoin_fallback_status(&fallback), PayjoinFallbackStatus::Confirmed);
-	}
-
-	#[tokio::test]
-	async fn payjoin_fallback_is_conflicted_by_a_buried_double_spend() {
-		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
-		let wallet = new_test_wallet(store, false).await;
-		let fallback = tx_spending(&wallet, payjoin_sender_outpoints()[0]);
-		// A different transaction spending the same sender input, such as the payjoin.
-		let payjoin = tx_spending(&wallet, payjoin_sender_outpoints()[0]);
-		let payjoin_txid = payjoin.compute_txid();
-		assert_ne!(payjoin_txid, fallback.compute_txid());
-
-		insert_confirmed_tx(&wallet, payjoin.clone(), 10);
-		set_chain_tip(&wallet, 10 + ANTI_REORG_DELAY - 2);
-		assert_eq!(wallet.payjoin_fallback_status(&fallback), PayjoinFallbackStatus::Unresolved);
-
-		set_chain_tip(&wallet, 10 + ANTI_REORG_DELAY - 1);
-		assert_eq!(
-			wallet.payjoin_fallback_status(&fallback),
-			PayjoinFallbackStatus::Conflicted(payjoin)
-		);
 	}
 }

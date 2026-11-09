@@ -2603,7 +2603,7 @@ fn build_with_store_internal(
 			},
 		};
 
-		Some(Arc::new(PayjoinManager::new(
+		let payjoin_manager = Arc::new(PayjoinManager::new(
 			Arc::clone(&payjoin_session_store),
 			payjoin_seen_inputs_store,
 			Arc::clone(&logger),
@@ -2612,7 +2612,10 @@ fn build_with_store_internal(
 			Arc::clone(&fee_estimator),
 			Arc::clone(&chain_source),
 			Arc::clone(&tx_broadcaster),
-		)))
+		));
+		// Wallet sync settles payjoin sessions on the transactions it sees.
+		wallet.set_payjoin_manager(Arc::downgrade(&payjoin_manager));
+		Some(payjoin_manager)
 	} else {
 		None
 	};
