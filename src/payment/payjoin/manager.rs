@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use bitcoin::{psbt::Input, Amount, FeeRate, Transaction, TxIn};
+use bitcoin::{psbt::Input, Amount, BlockHash, FeeRate, Transaction, TxIn};
 
 use lightning::ln::channelmanager::PaymentId;
 use lightning::log_warn;
@@ -28,8 +28,8 @@ use payjoin::ImplementationError;
 
 use crate::chain::ChainSource;
 use crate::config::{
-	Config, PayjoinConfig, PAYJOIN_MAX_RESPONSE_BYTES, PAYJOIN_RELAY_TIMEOUT_SECS,
-	PAYJOIN_RETRY_DELAY, PAYJOIN_SESSION_CLEANUP_AGE_SECS,
+	Config, PayjoinConfig, PAYJOIN_FALLBACK_REBROADCAST_TIMEOUT_SECS, PAYJOIN_MAX_RESPONSE_BYTES,
+	PAYJOIN_RELAY_TIMEOUT_SECS, PAYJOIN_RETRY_DELAY, PAYJOIN_SESSION_CLEANUP_AGE_SECS,
 };
 use crate::fee_estimator::{ConfirmationTarget, FeeEstimator, OnchainFeeEstimator};
 use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
@@ -38,7 +38,7 @@ use crate::payment::payjoin::persist::KVStorePayjoinReceiverPersister;
 use crate::payment::payjoin::seen_inputs::check_and_record_seen_input;
 
 use crate::types::{Broadcaster, PayjoinSeenInputsStore, PayjoinSessionStore};
-use crate::wallet::Wallet;
+use crate::wallet::{PayjoinFallbackStatus, Wallet};
 use crate::Error;
 
 /// The result of opening a Payjoin receive session.
@@ -62,6 +62,9 @@ pub(crate) struct PayjoinManager {
 	chain_source: Arc<ChainSource>,
 	broadcaster: Arc<Broadcaster>,
 	session_retry_at: Arc<Mutex<HashMap<PaymentId, Instant>>>,
+	/// The wallet's chain tip when pending fallbacks were last rebroadcast. `None` until the
+	/// first pass after startup, which rebroadcasts what a restart dropped from the queue.
+	fallback_rebroadcast_tip: Arc<Mutex<Option<BlockHash>>>,
 }
 
 impl PayjoinManager {
@@ -81,6 +84,7 @@ impl PayjoinManager {
 			chain_source,
 			broadcaster,
 			session_retry_at: Arc::new(Mutex::new(HashMap::new())),
+			fallback_rebroadcast_tip: Arc::new(Mutex::new(None)),
 		}
 	}
 
@@ -792,10 +796,10 @@ impl PayjoinManager {
 				self.payjoin_session_store.insert_or_update(session).await?;
 			},
 			ReceiverSessionOutcome::FallbackBroadcasted => {
-				log_info!(self.logger, "Payjoin failed. Fallback transaction was broadcasted.");
-				session.status = PayjoinStatus::Failed;
-
-				self.payjoin_session_store.insert_or_update(session).await?;
+				// Only replay of a session still marked active gets here, which means persisting
+				// the pending fallback failed, so the broadcast may not have happened.
+				log_info!(self.logger, "Payjoin failed. Broadcasting the fallback transaction.");
+				self.close_session_with_fallback(&mut session, None).await;
 			},
 			ReceiverSessionOutcome::Aborted => {
 				log_info!(self.logger, "Payjoin session was aborted.");
@@ -946,25 +950,31 @@ impl PayjoinManager {
 		Ok(())
 	}
 
+	/// Closes a session whose payjoin didn't complete and broadcasts its fallback transaction.
+	///
+	/// The broadcast queue doesn't survive a restart, so the session is persisted as
+	/// [`PayjoinStatus::FallbackPending`] with its fallback before the fallback is queued, and
+	/// [`Self::rebroadcast_pending_fallbacks`] keeps broadcasting it until it resolves.
 	async fn close_session_with_fallback(
 		&self, session: &mut PayjoinSession, fallback_tx: Option<&Transaction>,
 	) {
-		session.status = PayjoinStatus::Failed;
 		// Keep an earlier timestamp if payjoin's `close()` already ran
 		session.completed_at.get_or_insert_with(|| {
 			SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0)).as_secs()
 		});
 
-		let fallback_tx = fallback_tx.or_else(|| session.fallback_tx());
+		let fallback_tx = fallback_tx.cloned().or_else(|| session.fallback_tx().cloned());
 
-		if let Some(fallback_tx) = fallback_tx {
-			self.broadcaster.broadcast(fallback_tx.clone());
+		if let Some(fallback_tx) = &fallback_tx {
+			session.set_fallback_tx(fallback_tx.clone());
+			session.status = PayjoinStatus::FallbackPending;
 		} else {
 			log_warn!(
 				self.logger,
 				"Payjoin session {} missing fallback transaction; closing as Failed without broadcast.",
 				session.session_id
 			);
+			session.status = PayjoinStatus::Failed;
 		}
 
 		if let Err(close_err) = self.payjoin_session_store.insert_or_update(session.clone()).await {
@@ -976,6 +986,120 @@ impl PayjoinManager {
 			);
 		} else {
 			log_info!(self.logger, "Closed failed receiver session: {}", session.session_id);
+		}
+
+		// Broadcast even if persisting failed: a broadcast that may not be retried beats none.
+		if let Some(fallback_tx) = fallback_tx {
+			self.broadcaster.broadcast(fallback_tx);
+		}
+	}
+
+	/// Rebroadcasts the fallback transaction of every [`PayjoinStatus::FallbackPending`] session
+	/// once per chain tip, and marks a session [`PayjoinStatus::Failed`] once the wallet sees its
+	/// fallback, or a transaction double-spending it, confirmed through `ANTI_REORG_DELAY`.
+	///
+	/// Like the wallet's rebroadcast of its own unconfirmed transactions, this runs on chain tip
+	/// changes, and its first pass after startup rebroadcasts what a restart dropped from the
+	/// broadcast queue.
+	pub(crate) async fn rebroadcast_pending_fallbacks(&self) {
+		// Compared by hash, so a reorg replacing the tip at the same height counts as a change.
+		let tip = self.wallet.best_block_hash();
+		{
+			let mut last_tip = self.fallback_rebroadcast_tip.lock().expect("lock");
+			if *last_tip == Some(tip) {
+				return;
+			}
+			*last_tip = Some(tip);
+		}
+
+		let pending_sessions = self
+			.payjoin_session_store
+			.list_filter(|s| s.status == PayjoinStatus::FallbackPending)
+			.await;
+
+		let now = SystemTime::now()
+			.duration_since(UNIX_EPOCH)
+			.unwrap_or(Duration::from_secs(0))
+			.as_secs();
+
+		for session in pending_sessions {
+			let session_id = session.session_id;
+			let Some(fallback_tx) = session.fallback_tx() else {
+				log_warn!(
+					self.logger,
+					"Payjoin session {} is pending a fallback it doesn't have; marking it Failed.",
+					session_id
+				);
+				self.resolve_pending_fallback(session_id).await;
+				continue;
+			};
+			let fallback_txid = fallback_tx.compute_txid();
+
+			match self.wallet.payjoin_fallback_status(fallback_tx) {
+				PayjoinFallbackStatus::Confirmed => {
+					log_info!(
+						self.logger,
+						"Fallback transaction {} of payjoin session {} confirmed.",
+						fallback_txid,
+						session_id
+					);
+					self.resolve_pending_fallback(session_id).await;
+				},
+				PayjoinFallbackStatus::Conflicted(txid) => {
+					log_info!(
+						self.logger,
+						"Fallback transaction {} of payjoin session {} was double-spent by {}.",
+						fallback_txid,
+						session_id,
+						txid
+					);
+					self.resolve_pending_fallback(session_id).await;
+				},
+				PayjoinFallbackStatus::Unresolved => {
+					let closed_at = session.completed_at.unwrap_or(session.latest_update_timestamp);
+					if now.saturating_sub(closed_at) > PAYJOIN_FALLBACK_REBROADCAST_TIMEOUT_SECS {
+						log_warn!(
+							self.logger,
+							"Giving up on fallback transaction {} of payjoin session {}: not confirmed after {}s.",
+							fallback_txid,
+							session_id,
+							PAYJOIN_FALLBACK_REBROADCAST_TIMEOUT_SECS
+						);
+						self.resolve_pending_fallback(session_id).await;
+					} else {
+						log_debug!(
+							self.logger,
+							"Rebroadcasting fallback transaction {} of payjoin session {}.",
+							fallback_txid,
+							session_id
+						);
+						self.broadcaster.broadcast(fallback_tx.clone());
+					}
+				},
+			}
+		}
+	}
+
+	/// Marks a [`PayjoinStatus::FallbackPending`] session [`PayjoinStatus::Failed`], ending the
+	/// rebroadcast of its fallback.
+	async fn resolve_pending_fallback(&self, session_id: PaymentId) {
+		let res = self
+			.payjoin_session_store
+			.mutate(&session_id, |existing| {
+				let mut session = existing?.clone();
+				(session.status == PayjoinStatus::FallbackPending).then(|| {
+					session.status = PayjoinStatus::Failed;
+					session
+				})
+			})
+			.await;
+		if let Err(e) = res {
+			log_error!(
+				self.logger,
+				"Failed to mark payjoin session {} as Failed: {:?}. Will retry on the next chain tip.",
+				session_id,
+				e
+			);
 		}
 	}
 

@@ -90,6 +90,19 @@ pub(crate) enum FundingAmount {
 	Max,
 }
 
+/// Where a payjoin fallback transaction stands, as returned by
+/// [`Wallet::payjoin_fallback_status`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PayjoinFallbackStatus {
+	/// Neither the fallback nor a transaction double-spending it has confirmed through
+	/// [`ANTI_REORG_DELAY`], so the fallback may still need broadcasting.
+	Unresolved,
+	/// The fallback confirmed through [`ANTI_REORG_DELAY`].
+	Confirmed,
+	/// A transaction double-spending the fallback confirmed through [`ANTI_REORG_DELAY`].
+	Conflicted(Txid),
+}
+
 mod payment_stores;
 pub(crate) mod persist;
 pub(crate) mod provenance;
@@ -3164,6 +3177,43 @@ impl Wallet {
 			})
 			.await?;
 		Ok(())
+	}
+
+	/// The hash of the wallet's chain tip.
+	pub(crate) fn best_block_hash(&self) -> bitcoin::BlockHash {
+		self.inner.lock().expect("lock").latest_checkpoint().hash()
+	}
+
+	/// Reports whether a payjoin fallback transaction still needs broadcasting.
+	///
+	/// The fallback spends the sender's inputs and pays us, so wallet sync picks it up, as it does
+	/// any competing spend of the sender's inputs that also pays us, such as the payjoin itself. A
+	/// competing spend paying only others never enters the wallet's graph, so to the wallet it
+	/// leaves the fallback unresolved.
+	pub(crate) fn payjoin_fallback_status(
+		&self, fallback_tx: &Transaction,
+	) -> PayjoinFallbackStatus {
+		let fallback_txid = fallback_tx.compute_txid();
+		let locked_wallet = self.inner.lock().expect("lock");
+		let tip_height = locked_wallet.latest_checkpoint().height();
+		for input in &fallback_tx.input {
+			for spender in locked_wallet.tx_graph().outspends(input.previous_output) {
+				// `get_tx` is canonical-only, so a spend that lost a conflict doesn't count.
+				let Some(ChainPosition::Confirmed { anchor, .. }) =
+					locked_wallet.get_tx(*spender).map(|tx| tx.chain_position)
+				else {
+					continue;
+				};
+				if tip_height >= anchor.block_id.height + ANTI_REORG_DELAY - 1 {
+					return if *spender == fallback_txid {
+						PayjoinFallbackStatus::Confirmed
+					} else {
+						PayjoinFallbackStatus::Conflicted(*spender)
+					};
+				}
+			}
+		}
+		PayjoinFallbackStatus::Unresolved
 	}
 
 	/// Records a funding payment the way the node does: the rounds this node signed supply the
@@ -10320,6 +10370,52 @@ mod tests {
 			matches!(payment.kind, PaymentKind::Onchain { tx_type: None, .. }),
 			"unexpected kind {:?}",
 			payment.kind,
+		);
+	}
+
+	/// A sender's input, unknown to the wallet, that a payjoin fallback spends.
+	fn sender_outpoint() -> OutPoint {
+		OutPoint { txid: Txid::from_byte_array([50u8; 32]), vout: 0 }
+	}
+
+	#[tokio::test]
+	async fn payjoin_fallback_stays_unresolved_until_buried() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+		let fallback = tx_spending(&wallet, sender_outpoint());
+
+		// Not yet seen by wallet sync.
+		assert_eq!(wallet.payjoin_fallback_status(&fallback), PayjoinFallbackStatus::Unresolved);
+
+		insert_unconfirmed_tx(&wallet, fallback.clone());
+		assert_eq!(wallet.payjoin_fallback_status(&fallback), PayjoinFallbackStatus::Unresolved);
+
+		insert_confirmed_tx(&wallet, fallback.clone(), 10);
+		set_chain_tip(&wallet, 10 + ANTI_REORG_DELAY - 2);
+		assert_eq!(wallet.payjoin_fallback_status(&fallback), PayjoinFallbackStatus::Unresolved);
+
+		set_chain_tip(&wallet, 10 + ANTI_REORG_DELAY - 1);
+		assert_eq!(wallet.payjoin_fallback_status(&fallback), PayjoinFallbackStatus::Confirmed);
+	}
+
+	#[tokio::test]
+	async fn payjoin_fallback_is_conflicted_by_a_buried_double_spend() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+		let fallback = tx_spending(&wallet, sender_outpoint());
+		// A different transaction spending the same sender input, such as the payjoin.
+		let payjoin = tx_spending(&wallet, sender_outpoint());
+		let payjoin_txid = payjoin.compute_txid();
+		assert_ne!(payjoin_txid, fallback.compute_txid());
+
+		insert_confirmed_tx(&wallet, payjoin, 10);
+		set_chain_tip(&wallet, 10 + ANTI_REORG_DELAY - 2);
+		assert_eq!(wallet.payjoin_fallback_status(&fallback), PayjoinFallbackStatus::Unresolved);
+
+		set_chain_tip(&wallet, 10 + ANTI_REORG_DELAY - 1);
+		assert_eq!(
+			wallet.payjoin_fallback_status(&fallback),
+			PayjoinFallbackStatus::Conflicted(payjoin_txid)
 		);
 	}
 }
