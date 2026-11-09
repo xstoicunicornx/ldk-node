@@ -100,11 +100,6 @@ impl PayjoinManager {
 		let payjoin_config =
 			self.config.payjoin_config.as_ref().ok_or(Error::PayjoinNotConfigured)?;
 
-		if payjoin_config.ohttp_relays.is_empty() {
-			log_error!(self.logger, "No OHTTP relays configured.");
-			return Err(Error::PayjoinNotConfigured);
-		}
-
 		// Generate a new session ID
 		let mut random_bytes = [0u8; 32];
 		getrandom::fill(&mut random_bytes).map_err(|e| {

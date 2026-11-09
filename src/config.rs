@@ -959,13 +959,29 @@ pub struct PayjoinConfig {
 	pub ohttp_relays: Vec<String>,
 }
 
+impl PayjoinConfig {
+	/// Whether the directory and at least one relay are given, all as `http` or `https` URLs.
+	///
+	/// Parsed as payjoin parses them when it uses them, so whatever passes here, payjoin accepts.
+	pub(crate) fn is_valid(&self) -> bool {
+		let is_http_url = |url: &str| {
+			payjoin::Url::parse(url)
+				.map(|url| url.scheme() == "http" || url.scheme() == "https")
+				.unwrap_or(false)
+		};
+		is_http_url(&self.payjoin_directory)
+			&& !self.ohttp_relays.is_empty()
+			&& self.ohttp_relays.iter().all(|relay| is_http_url(relay))
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
 
 	use super::{
 		clamp_full_scan_stop_gap, default_user_config, may_announce_channel, AnnounceError, Config,
-		ElectrumSyncConfig, EsploraSyncConfig, NodeAlias, SocketAddress,
+		ElectrumSyncConfig, EsploraSyncConfig, NodeAlias, PayjoinConfig, SocketAddress,
 		DEFAULT_FULL_SCAN_STOP_GAP, MAX_FULL_SCAN_STOP_GAP, MIN_FULL_SCAN_STOP_GAP,
 	};
 
@@ -1062,5 +1078,24 @@ mod tests {
 		assert_eq!(clamp_full_scan_stop_gap(MAX_FULL_SCAN_STOP_GAP), MAX_FULL_SCAN_STOP_GAP);
 		assert_eq!(clamp_full_scan_stop_gap(0), MIN_FULL_SCAN_STOP_GAP);
 		assert_eq!(clamp_full_scan_stop_gap(MAX_FULL_SCAN_STOP_GAP + 1), MAX_FULL_SCAN_STOP_GAP);
+	}
+
+	#[test]
+	fn payjoin_config_needs_http_urls_and_a_relay() {
+		let config = |directory: &str, relays: &[&str]| PayjoinConfig {
+			payjoin_directory: directory.to_string(),
+			ohttp_relays: relays.iter().map(|relay| relay.to_string()).collect(),
+		};
+
+		assert!(config("https://payjo.in", &["https://pj.bobspacebkk.com"]).is_valid());
+		// Plain http, as for a local directory and relay on regtest.
+		assert!(config("http://127.0.0.1:8080", &["http://localhost:3000"]).is_valid());
+
+		assert!(!config("https://payjo.in", &[]).is_valid());
+		assert!(!config("ftp://payjo.in", &["https://pj.bobspacebkk.com"]).is_valid());
+		assert!(!config("https://payjo.in", &["https://pj.bobspacebkk.com", "socks5://relay"])
+			.is_valid());
+		assert!(!config("not a url", &["https://pj.bobspacebkk.com"]).is_valid());
+		assert!(!config("https://payjo.in", &["payjo.in"]).is_valid());
 	}
 }

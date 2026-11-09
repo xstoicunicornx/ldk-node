@@ -202,6 +202,9 @@ pub enum BuildError {
 	InvalidTorProxyAddress,
 	/// The provided alias is invalid.
 	InvalidNodeAlias,
+	/// The given payjoin configuration is invalid, e.g. no OHTTP relay or a URL that isn't
+	/// `http` or `https` was passed.
+	InvalidPayjoinConfig,
 	/// An attempt to setup a runtime has failed.
 	RuntimeSetupFailed,
 	/// We failed to read data from the [`KVStore`].
@@ -290,6 +293,7 @@ impl fmt::Display for BuildError {
 			Self::WalletRescanHeightTooHigh => {
 				write!(f, "Wallet rescan height is above the current chain tip.")
 			},
+			Self::InvalidPayjoinConfig => write!(f, "Given payjoin configuration is invalid."),
 			Self::PayjoinConfigMismatch => {
 				write!(f, "Payjoin requires a Bitcoin Core chain source, but a different one was configured.")
 			},
@@ -693,9 +697,18 @@ impl NodeBuilder {
 	///
 	/// The `payjoin_config` specifies the Payjoin directory and OHTTP relay URLs required
 	/// by the Payjoin v2 protocol.
-	pub fn set_payjoin_config(&mut self, payjoin_config: PayjoinConfig) -> &mut Self {
+	///
+	/// Returns [`BuildError::InvalidPayjoinConfig`] unless the directory and at least one relay
+	/// are given, all as `http` or `https` URLs.
+	pub fn set_payjoin_config(
+		&mut self, payjoin_config: PayjoinConfig,
+	) -> Result<&mut Self, BuildError> {
+		if !payjoin_config.is_valid() {
+			return Err(BuildError::InvalidPayjoinConfig);
+		}
+
 		self.config.payjoin_config = Some(payjoin_config);
-		self
+		Ok(self)
 	}
 
 	/// Sets background probing config.
@@ -1326,8 +1339,11 @@ impl Builder {
 	///
 	/// The `payjoin_config` specifies the Payjoin directory and OHTTP relay URLs required
 	/// by the Payjoin v2 protocol.
-	pub fn set_payjoin_config(&self, payjoin_config: PayjoinConfig) {
-		self.inner.write().expect("lock").set_payjoin_config(payjoin_config);
+	///
+	/// Returns [`BuildError::InvalidPayjoinConfig`] unless the directory and at least one relay
+	/// are given, all as `http` or `https` URLs.
+	pub fn set_payjoin_config(&self, payjoin_config: PayjoinConfig) -> Result<(), BuildError> {
+		self.inner.write().expect("lock").set_payjoin_config(payjoin_config).map(|_| ())
 	}
 
 	/// Configures background probing.
@@ -1579,6 +1595,13 @@ fn build_with_store_internal(
 				return Err(BuildError::InvalidTorProxyAddress);
 			},
 			_ => {},
+		}
+	}
+
+	if let Some(payjoin_config) = &config.payjoin_config {
+		if !payjoin_config.is_valid() {
+			log_error!(logger, "Given payjoin configuration is invalid.");
+			return Err(BuildError::InvalidPayjoinConfig);
 		}
 	}
 
@@ -2869,6 +2892,26 @@ mod tests {
 		);
 
 		assert!(matches!(result, Err(BuildError::ReadFailed)));
+	}
+
+	#[test]
+	fn invalid_payjoin_config_from_config_fails_build() {
+		let mut config = crate::config::Config::default();
+		config.payjoin_config = Some(crate::config::PayjoinConfig {
+			payjoin_directory: "https://payjo.in".to_string(),
+			ohttp_relays: vec![],
+		});
+		let builder = NodeBuilder::from_config(config);
+		let logger = Arc::new(Logger::new_log_facade());
+		#[cfg(not(feature = "uniffi"))]
+		let node_entropy = NodeEntropy::from_seed_bytes([42; 64]);
+		#[cfg(feature = "uniffi")]
+		let node_entropy = NodeEntropy::from_seed_bytes(vec![42; 64]).unwrap();
+
+		let result =
+			builder.build_with_store_and_logger(node_entropy, InMemoryStore::new(), logger);
+
+		assert!(matches!(result, Err(BuildError::InvalidPayjoinConfig)));
 	}
 
 	#[test]
