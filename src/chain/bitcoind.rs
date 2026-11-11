@@ -774,24 +774,6 @@ impl BitcoindChainSource {
 			},
 		}
 	}
-
-	pub(crate) async fn get_transaction(&self, txid: &Txid) -> Result<Option<Transaction>, Error> {
-		let timeout_fut = tokio::time::timeout(
-			Duration::from_secs(DEFAULT_TX_LOOKUP_TIMEOUT_SECS),
-			self.api_client.get_raw_transaction(txid),
-		);
-
-		match timeout_fut.await {
-			Ok(res) => res.map_err(|e| {
-				log_error!(self.logger, "Failed to get transaction {}: {}", txid, e);
-				Error::TxLookupFailed
-			}),
-			Err(e) => {
-				log_error!(self.logger, "Failed to get transaction {} due to timeout: {}", txid, e);
-				Err(Error::TxLookupTimeout)
-			},
-		}
-	}
 }
 
 #[derive(Clone)]

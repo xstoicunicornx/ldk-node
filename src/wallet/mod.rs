@@ -3783,6 +3783,124 @@ impl Wallet {
 		Ok(psbt)
 	}
 
+	/// Returns the transactions in the wallet that spend any of `outpoints`, each with its number
+	/// of confirmations (0 while unconfirmed), most confirmed first.
+	///
+	/// Used to settle a payjoin: the payjoin, the sender's fallback, and any other spend of the
+	/// sender's inputs that pays us all reach the wallet through sync. A spend paying only others
+	/// never does.
+	pub(crate) fn spends_of_outpoints(
+		&self, outpoints: impl IntoIterator<Item = OutPoint>,
+	) -> Vec<(Transaction, u32)> {
+		let locked_wallet = self.inner.lock().expect("lock");
+		let tip_height = locked_wallet.latest_checkpoint().height();
+
+		let mut seen = HashSet::new();
+		let mut spends = Vec::new();
+		for outpoint in outpoints {
+			for spender in locked_wallet.tx_graph().outspends(outpoint) {
+				if !seen.insert(*spender) {
+					continue;
+				}
+				// `get_tx` is canonical-only, so a spend that lost a conflict doesn't count.
+				let Some(wallet_tx) = locked_wallet.get_tx(*spender) else {
+					continue;
+				};
+				let confirmations = match wallet_tx.chain_position {
+					ChainPosition::Confirmed { anchor, .. } => {
+						tip_height.saturating_sub(anchor.block_id.height).saturating_add(1)
+					},
+					ChainPosition::Unconfirmed { .. } => 0,
+				};
+				spends.push((wallet_tx.tx_node.tx.as_ref().clone(), confirmations));
+			}
+		}
+		spends.sort_by(|a, b| b.1.cmp(&a.1));
+		spends
+	}
+
+	/// Returns the transactions in the wallet that spend an input of `tx` but lost the conflict,
+	/// so are no longer canonical.
+	pub(crate) fn lost_conflicts_of(&self, tx: &Transaction) -> Vec<Transaction> {
+		let locked_wallet = self.inner.lock().expect("lock");
+		let graph = locked_wallet.tx_graph();
+
+		let mut seen = HashSet::new();
+		graph
+			.direct_conflicts(tx)
+			.filter(|(_, txid)| seen.insert(*txid))
+			// `get_tx` is canonical-only, so it skips a conflict that won or is still pending.
+			.filter(|(_, txid)| locked_wallet.get_tx(*txid).is_none())
+			.filter_map(|(_, txid)| graph.get_tx(txid))
+			.map(|tx| tx.as_ref().clone())
+			.collect()
+	}
+
+	/// Fails the on-chain payment of `txid`, a transaction that lost a conflict to one confirmed
+	/// through [`ANTI_REORG_DELAY`], and removes its pending entry.
+	///
+	/// Wallet sync leaves such a record pending, as it only fails funding payments lost to a
+	/// conflict. Only a record still pending on the unconfirmed `txid` is failed, so one that has
+	/// moved on is left alone. A record already failed, by a pass whose entry removal was lost to
+	/// a crash, gets its lingering entry removed. `tx_type` classifies the record if it isn't yet.
+	pub(crate) async fn fail_payment_lost_to_conflict(
+		&self, txid: Txid, tx_type: Option<TransactionType>,
+	) -> Result<(), Error> {
+		// Held across both stores, as wallet sync and the classifiers do.
+		let stores = self.payment_stores.lock().await;
+
+		let payment_id =
+			self.find_payment_by_txid(txid).await?.unwrap_or(PaymentId(txid.to_byte_array()));
+
+		let (mut failed, mut remove_entry) = (false, false);
+		stores
+			.mutate_payment(&payment_id, |existing| {
+				let current = existing?;
+				let PaymentKind::Onchain {
+					txid: record_txid,
+					status: ConfirmationStatus::Unconfirmed,
+					tx_type: current_tx_type,
+				} = &current.kind
+				else {
+					return None;
+				};
+				if *record_txid != txid {
+					return None;
+				}
+				match current.status {
+					PaymentStatus::Pending => {
+						let mut update = PaymentDetailsUpdate::new(payment_id);
+						update.status = Some(PaymentStatus::Failed);
+						if current_tx_type.is_none() {
+							update.tx_type = Some(tx_type.clone());
+						}
+						let mut updated = current.clone();
+						(failed, remove_entry) = (true, true);
+						updated.update(update).then_some(updated)
+					},
+					PaymentStatus::Failed => {
+						remove_entry = true;
+						None
+					},
+					PaymentStatus::Succeeded => None,
+				}
+			})
+			.await?;
+
+		if remove_entry {
+			stores.remove_pending_payment(&payment_id).await?;
+		}
+		if failed {
+			log_info!(
+				self.logger,
+				"Failed payment {}: transaction {} lost to a conflicting transaction confirmed beyond the reorg depth",
+				payment_id,
+				txid,
+			);
+		}
+		Ok(())
+	}
+
 	pub(crate) fn list_unspent_confirmed_utxos(&self) -> Result<Vec<Utxo>, Error> {
 		self.list_confirmed_utxos_inner().map_err(|()| Error::WalletOperationFailed)
 	}
@@ -10321,5 +10439,114 @@ mod tests {
 			"unexpected kind {:?}",
 			payment.kind,
 		);
+	}
+
+	/// Two inputs of a payjoin sender, unknown to the wallet.
+	fn payjoin_sender_outpoints() -> [OutPoint; 2] {
+		[
+			OutPoint { txid: Txid::from_byte_array([50u8; 32]), vout: 0 },
+			OutPoint { txid: Txid::from_byte_array([51u8; 32]), vout: 1 },
+		]
+	}
+
+	#[tokio::test]
+	async fn spends_of_outpoints_lists_most_confirmed_first() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+		let [first, second] = payjoin_sender_outpoints();
+		assert!(wallet.spends_of_outpoints([first, second]).is_empty());
+
+		let unconfirmed = tx_spending(&wallet, first);
+		insert_unconfirmed_tx(&wallet, unconfirmed.clone());
+		assert_eq!(wallet.spends_of_outpoints([first, second]), vec![(unconfirmed.clone(), 0)]);
+
+		let confirmed = tx_spending(&wallet, second);
+		insert_confirmed_tx(&wallet, confirmed.clone(), 10);
+		set_chain_tip(&wallet, 12);
+		assert_eq!(
+			wallet.spends_of_outpoints([first, second]),
+			vec![(confirmed, 3), (unconfirmed.clone(), 0)]
+		);
+
+		// Only spends of the given outpoints count.
+		assert_eq!(wallet.spends_of_outpoints([first]), vec![(unconfirmed, 0)]);
+	}
+
+	#[tokio::test]
+	async fn spends_of_outpoints_lists_a_spend_once_and_skips_non_canonical() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+		let [first, second] = payjoin_sender_outpoints();
+
+		let mut spend = tx_spending(&wallet, first);
+		spend.input.push(bitcoin::TxIn { previous_output: second, ..Default::default() });
+		insert_unconfirmed_tx(&wallet, spend.clone());
+		assert_eq!(wallet.spends_of_outpoints([first, second]), vec![(spend.clone(), 0)]);
+
+		evict_tx(&wallet, spend.compute_txid());
+		assert!(wallet.spends_of_outpoints([first, second]).is_empty());
+	}
+
+	#[tokio::test]
+	async fn payment_lost_to_a_buried_conflict_is_failed() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+		let [sender_outpoint, _] = payjoin_sender_outpoints();
+
+		// Wallet sync records the payjoin, which a reorg then replaces with the fallback.
+		let payjoin = tx_spending(&wallet, sender_outpoint);
+		let payjoin_txid = payjoin.compute_txid();
+		observe_unconfirmed(&wallet, &payjoin).await;
+		let fallback = tx_spending(&wallet, sender_outpoint);
+		insert_confirmed_tx(&wallet, fallback.clone(), 10);
+		set_chain_tip(&wallet, 10 + ANTI_REORG_DELAY - 1);
+
+		assert_eq!(wallet.lost_conflicts_of(&fallback), vec![payjoin.clone()]);
+		// The fallback won, so it lost nothing to the payjoin.
+		assert!(wallet.lost_conflicts_of(&payjoin).is_empty());
+
+		let payment_id = PaymentId(payjoin_txid.to_byte_array());
+		for _ in 0..2 {
+			wallet
+				.fail_payment_lost_to_conflict(payjoin_txid, Some(TransactionType::Payjoin))
+				.await
+				.unwrap();
+			let payment =
+				wallet.payment_stores.payment_store().get(&payment_id).await.unwrap().unwrap();
+			assert_eq!(payment.status, PaymentStatus::Failed);
+			assert_eq!(
+				payment.kind,
+				PaymentKind::Onchain {
+					txid: payjoin_txid,
+					status: ConfirmationStatus::Unconfirmed,
+					tx_type: Some(TransactionType::Payjoin),
+				}
+			);
+			assert!(!wallet.payment_stores.has_pending_payment(&payment_id).await.unwrap());
+		}
+	}
+
+	#[tokio::test]
+	async fn confirmed_payment_is_not_failed_as_lost() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let wallet = new_test_wallet(store, false).await;
+		let [sender_outpoint, _] = payjoin_sender_outpoints();
+
+		let tx = tx_spending(&wallet, sender_outpoint);
+		let txid = tx.compute_txid();
+		observe_unconfirmed(&wallet, &tx).await;
+		let payment_id = PaymentId(txid.to_byte_array());
+		let mut update = PaymentDetailsUpdate::new(payment_id);
+		update.confirmation_status = Some(ConfirmationStatus::Confirmed {
+			block_hash: bitcoin::BlockHash::from_byte_array([10u8; 32]),
+			height: 10,
+			timestamp: 100,
+		});
+		wallet.payment_stores.payment_store().update(update).await.unwrap();
+
+		wallet.fail_payment_lost_to_conflict(txid, None).await.unwrap();
+		let payment =
+			wallet.payment_stores.payment_store().get(&payment_id).await.unwrap().unwrap();
+		assert_eq!(payment.status, PaymentStatus::Pending);
 	}
 }

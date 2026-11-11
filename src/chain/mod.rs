@@ -718,14 +718,6 @@ impl ChainSource {
 			},
 		}
 	}
-
-	pub(crate) async fn get_transaction(&self, txid: &Txid) -> Result<Option<Transaction>, Error> {
-		match &self.kind {
-			ChainSourceKind::Bitcoind(bitcoind) => bitcoind.get_transaction(txid).await,
-			ChainSourceKind::Esplora(esplora) => esplora.get_transaction(txid).await,
-			ChainSourceKind::Electrum(electrum) => electrum.get_transaction(txid).await,
-		}
-	}
 }
 
 impl Filter for ChainSource {

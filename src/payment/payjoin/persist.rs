@@ -27,8 +27,7 @@ pub(crate) struct KVStorePayjoinReceiverPersister {
 
 impl KVStorePayjoinReceiverPersister {
 	pub fn new(session_id: PaymentId, payjoin_session_store: Arc<PayjoinSessionStore>) -> Self {
-		let new_session =
-			PayjoinSession::new(session_id, PayjoinSessionKind::Receive);
+		let new_session = PayjoinSession::new(session_id, PayjoinSessionKind::Receive);
 
 		Self { session_id, payjoin_session_store, new_session: Some(new_session) }
 	}

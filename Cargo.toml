@@ -135,7 +135,8 @@ prost = { version = "0.11.6", default-features = false, optional = true}
 #bitcoin-payment-instructions = { version = "0.6" }
 bitcoin-payment-instructions = { git = "https://github.com/benthecarman/bitcoin-payment-instructions", rev = "3dbe11bdf8916639df42476501fb40f87b253e84", optional = true }
 
-payjoin = { version = "1.2.0", default-features = false, features = ["v2", "io"] }
+#payjoin = { version = "1.2.0", default-features = false, features = ["v2", "io"] }
+payjoin = { git = "https://github.com/payjoin/rust-payjoin", rev = "256fa2d1e33324684724a895b8d9a4677869a6a5", default-features = false, features = ["v2", "io"] }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = ["winbase"] }
