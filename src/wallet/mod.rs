@@ -3146,8 +3146,8 @@ impl Wallet {
 
 	/// Tags an incoming payjoin transaction as [`TransactionType::Payjoin`].
 	///
-	/// The sender broadcasts a payjoin, so we only learn the outcome once monitoring finds the
-	/// transaction, possibly after wallet sync has already recorded or even graduated it. Like a
+	/// The sender broadcasts a payjoin, so it's only known as one once it's classified against its
+	/// session, after wallet sync has recorded it, and possibly graduated it already. Like a
 	/// late funding classification, this merges only the classification into an existing record
 	/// and leaves its figures, status and confirmation state to wallet sync. If no record exists
 	/// yet, one is created from `tx` and marked as pending.
@@ -3162,9 +3162,8 @@ impl Wallet {
 		// the record and its pending index out of step.
 		let stores = self.payment_stores.lock().await;
 
-		let id = self.find_payment_by_txid(txid).await?.unwrap_or(PaymentId(txid.to_byte_array()));
-		let holds_txid = |payment: &PaymentDetails| matches!(payment.kind, PaymentKind::Onchain { txid: recorded, .. } if recorded == txid);
-		if stores.payment(&id).await?.is_some_and(|payment| !holds_txid(&payment)) {
+		let id = self.payment_id_of(txid).await?;
+		if stores.payment(&id).await?.is_some_and(|payment| !holds_txid(&payment, txid)) {
 			return Ok(());
 		}
 		let (amount_msat, fee_paid_msat, direction) = match tx {
@@ -3220,8 +3219,14 @@ impl Wallet {
 		Ok(())
 	}
 
-	/// Clears the [`TransactionType::Payjoin`] tag of the payment holding `txid`, which settled a
-	/// payjoin but isn't the payjoin.
+	/// The id of the payment record of `txid`, found as wallet sync finds it, so it may be one
+	/// first written for a transaction `txid` replaced.
+	async fn payment_id_of(&self, txid: Txid) -> Result<PaymentId, Error> {
+		Ok(self.find_payment_by_txid(txid).await?.unwrap_or(PaymentId(txid.to_byte_array())))
+	}
+
+	/// Clears the [`TransactionType::Payjoin`] tag of the payment holding `txid`, which spends the
+	/// sender's inputs of a payjoin session but isn't the payjoin.
 	///
 	/// Wallet sync records a replacement in the record of the transaction it replaced, so a
 	/// payjoin's record keeps its tag after the fallback replaces it, e.g. in a reorg. A payment's
@@ -3231,13 +3236,11 @@ impl Wallet {
 		// Held across both stores, as in `classify_payjoin`.
 		let stores = self.payment_stores.lock().await;
 
-		let id = self.find_payment_by_txid(txid).await?.unwrap_or(PaymentId(txid.to_byte_array()));
+		let id = self.payment_id_of(txid).await?;
 		let untag = |payment: &PaymentDetails| match payment.kind {
-			PaymentKind::Onchain {
-				txid: recorded,
-				status,
-				tx_type: Some(TransactionType::Payjoin),
-			} if recorded == txid => {
+			PaymentKind::Onchain { status, tx_type: Some(TransactionType::Payjoin), .. }
+				if holds_txid(payment, txid) =>
+			{
 				let mut untagged = payment.clone();
 				untagged.kind = PaymentKind::Onchain { txid, status, tx_type: None };
 				Some(untagged)
@@ -3923,22 +3926,21 @@ impl Wallet {
 		// Held across both stores, as wallet sync and the classifiers do.
 		let stores = self.payment_stores.lock().await;
 
-		let payment_id =
-			self.find_payment_by_txid(txid).await?.unwrap_or(PaymentId(txid.to_byte_array()));
+		let payment_id = self.payment_id_of(txid).await?;
 
 		let (mut failed, mut remove_entry) = (false, false);
 		stores
 			.mutate_payment(&payment_id, |existing| {
 				let current = existing?;
 				let PaymentKind::Onchain {
-					txid: record_txid,
 					status: ConfirmationStatus::Unconfirmed,
 					tx_type: current_tx_type,
+					..
 				} = &current.kind
 				else {
 					return None;
 				};
-				if *record_txid != txid {
+				if !holds_txid(current, txid) {
 					return None;
 				}
 				match current.status {
@@ -3989,6 +3991,11 @@ struct LocalStakeAggregate {
 /// Aggregates our net stake across the channels of a single [`FundingCandidate`] by summing each
 /// channel's signed [`FundingContribution::net_value`]. Returns no amount if we contributed to none
 /// of them.
+/// Whether `payment` is the on-chain record of `txid` now, not of a transaction it replaced.
+fn holds_txid(payment: &PaymentDetails, txid: Txid) -> bool {
+	matches!(payment.kind, PaymentKind::Onchain { txid: recorded, .. } if recorded == txid)
+}
+
 fn aggregate_local_stakes(candidate: &FundingCandidate) -> LocalStakeAggregate {
 	let mut net_stake = SignedAmount::ZERO;
 	let mut fee = Amount::ZERO;

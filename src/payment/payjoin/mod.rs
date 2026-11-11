@@ -10,9 +10,11 @@
 pub(crate) mod manager;
 pub(crate) mod payjoin_session;
 pub(crate) mod persist;
+pub(crate) mod replay;
 pub(crate) mod seen_inputs;
 
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitcoin::Txid;
 use lightning::ln::channelmanager::PaymentId;
@@ -29,12 +31,12 @@ pub enum PayjoinSessionStatus {
 	Active,
 	/// The payjoin transaction confirmed and the session completed.
 	Completed {
-		/// The payjoin transaction, if known. It is only unknown for a session closed by an
-		/// outcome that doesn't name the transaction, which this node doesn't record.
-		txid: Option<Txid>,
+		/// The payjoin transaction.
+		txid: Txid,
 	},
 	/// The payjoin didn't complete, so the sender's fallback transaction pays instead. It is
-	/// rebroadcast until it, or another spend of the sender's inputs, confirms.
+	/// rebroadcast until it, or another spend of the sender's inputs, is seen, and the session
+	/// ends once that confirms.
 	FallbackPending {
 		/// The sender's fallback transaction.
 		fallback_txid: Txid,
@@ -49,9 +51,14 @@ pub enum PayjoinSessionStatus {
 	/// The session was cancelled through [`PayjoinPayment::cancel`] and didn't complete.
 	Cancelled {
 		/// The sender's fallback transaction, if the session had received it. It is then
-		/// broadcast and rebroadcast until it, or another spend of the sender's inputs, confirms.
+		/// broadcast and rebroadcast until it, or another spend of the sender's inputs, is seen.
 		fallback_txid: Option<Txid>,
 	},
+}
+
+/// The current time, in seconds since the UNIX epoch.
+pub(crate) fn unix_now() -> u64 {
+	SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0)).as_secs()
 }
 
 #[cfg(not(feature = "uniffi"))]
@@ -91,6 +98,10 @@ impl PayjoinPayment {
 	pub(crate) fn new(manager: Option<Arc<PayjoinManager>>, is_running: Arc<RwLock<bool>>) -> Self {
 		Self { manager, is_running }
 	}
+
+	fn manager(&self) -> Result<&PayjoinManager, Error> {
+		self.manager.as_deref().ok_or(Error::PayjoinNotConfigured)
+	}
 }
 
 #[cfg_attr(feature = "uniffi", uniffi::export)]
@@ -109,7 +120,7 @@ impl PayjoinPayment {
 	pub async fn receive(
 		&self, amount_sats: u64, fee_rate: Option<FeeRate>,
 	) -> Result<PayjoinReceiveSession, Error> {
-		let manager = self.manager.as_ref().ok_or(Error::PayjoinNotConfigured)?;
+		let manager = self.manager()?;
 
 		if !*self.is_running.read().expect("lock") {
 			return Err(Error::NotRunning);
@@ -130,7 +141,7 @@ impl PayjoinPayment {
 	pub async fn status(
 		&self, session_id: PaymentId,
 	) -> Result<Option<PayjoinSessionStatus>, Error> {
-		let manager = self.manager.as_ref().ok_or(Error::PayjoinNotConfigured)?;
+		let manager = self.manager()?;
 		manager.session_status(session_id).await
 	}
 
@@ -142,15 +153,15 @@ impl PayjoinPayment {
 	/// we still get paid. Cancelling a session again has no further effect.
 	///
 	/// Returns [`Error::InvalidPaymentId`] for an unknown session, and
-	/// [`Error::PayjoinSessionNotCancellable`] if the session already ended, or if a transaction
-	/// spending the sender's inputs was already seen, so that cancelling can't change how it
-	/// settles.
+	/// [`Error::PayjoinSessionNotCancellable`] if the session already ended, its fallback is
+	/// already pending, or a transaction spending the sender's inputs was already seen, so that
+	/// cancelling can't change how it settles.
 	///
 	/// Returns [`Error::PayjoinNotConfigured`] if no [`PayjoinConfig`] was set.
 	///
 	/// [`PayjoinConfig`]: crate::config::PayjoinConfig
 	pub async fn cancel(&self, session_id: PaymentId) -> Result<(), Error> {
-		let manager = self.manager.as_ref().ok_or(Error::PayjoinNotConfigured)?;
+		let manager = self.manager()?;
 		manager.cancel_session(session_id).await
 	}
 }

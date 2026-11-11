@@ -906,27 +906,6 @@ impl Node {
 				}
 			});
 
-			// Rebroadcast pending payjoin fallbacks on chain tip changes. Kept apart from the resume
-			// task so a session that holds up resumption can't hold up the fallbacks too.
-			let fallback_payjoin_manager = Arc::clone(payjoin_manager);
-			let fallback_logger = Arc::clone(&self.logger);
-			let mut stop_fallback = self.stop_sender.subscribe();
-			self.runtime.spawn_cancellable_background_task(async move {
-				let mut interval = tokio::time::interval(PAYJOIN_RESUME_INTERVAL);
-				interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-				loop {
-					tokio::select! {
-						_ = stop_fallback.changed() => {
-							log_debug!(fallback_logger, "Stopping payjoin fallback rebroadcast task.");
-							return;
-						}
-						_ = interval.tick() => {
-							fallback_payjoin_manager.rebroadcast_pending_fallbacks().await;
-						}
-					}
-				}
-			});
-
 			// Periodically clean up old completed/failed payjoin sessions.
 			let cleanup_payjoin_manager = Arc::clone(payjoin_manager);
 			let cleanup_logger = Arc::clone(&self.logger);

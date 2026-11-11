@@ -228,7 +228,7 @@ pub(crate) const PAYJOIN_RESUME_INTERVAL: Duration = Duration::from_secs(15);
 // How long we hold back a payjoin session that failed to advance.
 pub(crate) const PAYJOIN_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 
-// The duration after which completed or failed payjoin sessions are cleaned up (24 hours).
+// How long after a payjoin session ended it's cleaned up (24 hours).
 pub(crate) const PAYJOIN_SESSION_CLEANUP_AGE_SECS: u64 = 24 * 60 * 60;
 
 // How long we remember a payjoin sender's input whose spend we never saw buried (30 days). Until
